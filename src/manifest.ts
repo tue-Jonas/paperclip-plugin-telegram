@@ -46,8 +46,15 @@ const manifest: PaperclipPluginManifestV1 = {
         format: "secret-ref",
         title: "Telegram Bot Token (secret reference)",
         description:
-          "Secret UUID for your Telegram Bot token. Create the secret in Settings > Secrets, then paste its UUID here. Get a token from @BotFather.",
+          "Secret UUID for your Telegram Bot token. Create the secret in Settings > Secrets, then paste its UUID here. Get a token from @BotFather. Preferred once the host enables company-scoped plugin secret references.",
         default: DEFAULT_CONFIG.telegramBotTokenRef,
+      },
+      telegramBotToken: {
+        type: "string",
+        title: "Telegram Bot Token (inline)",
+        description:
+          "Raw Telegram Bot token from @BotFather. Use this on host builds where plugin secret references are disabled. If set, it takes precedence over telegramBotTokenRef. Stored in plugin config (not the encrypted secret store) — prefer telegramBotTokenRef when the host supports it.",
+        default: DEFAULT_CONFIG.telegramBotToken,
       },
       paperclipBaseUrl: {
         type: "string",
@@ -288,7 +295,7 @@ const manifest: PaperclipPluginManifestV1 = {
         default: DEFAULT_CONFIG.watchDeduplicationWindowMs,
       },
     },
-    required: ["telegramBotTokenRef"],
+    required: [],
   },
   jobs: [
     {

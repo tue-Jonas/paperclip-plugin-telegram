@@ -47,6 +47,7 @@ import type { EscalationEvent } from "./escalation.js";
 
 type TelegramConfig = {
   telegramBotTokenRef: string;
+  telegramBotToken?: string;
   defaultChatId: string;
   approvalsChatId: string;
   errorsChatId: string;
@@ -148,12 +149,19 @@ const plugin = definePlugin({
     const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
     const publicUrl = config.paperclipPublicUrl || baseUrl;
 
-    if (!config.telegramBotTokenRef) {
-      ctx.logger.warn("No telegramBotTokenRef configured, plugin disabled");
+    // Resolve the bot token. Prefer the inline value (host builds where plugin
+    // secret references are disabled); otherwise resolve the secret reference.
+    const token = config.telegramBotToken
+      ? config.telegramBotToken
+      : config.telegramBotTokenRef
+        ? await ctx.secrets.resolve(config.telegramBotTokenRef)
+        : "";
+    if (!token) {
+      ctx.logger.warn(
+        "No telegram bot token configured (telegramBotToken or telegramBotTokenRef), plugin disabled",
+      );
       return;
     }
-
-    const token = await ctx.secrets.resolve(config.telegramBotTokenRef);
 
     // --- Register bot commands with Telegram ---
     if (config.enableCommands) {
@@ -788,8 +796,10 @@ const plugin = definePlugin({
   },
 
   async onValidateConfig(config) {
-    if (!config.telegramBotTokenRef || typeof config.telegramBotTokenRef !== "string") {
-      return { ok: false, errors: ["telegramBotTokenRef is required"] };
+    const hasInline = typeof config.telegramBotToken === "string" && config.telegramBotToken.length > 0;
+    const hasRef = typeof config.telegramBotTokenRef === "string" && config.telegramBotTokenRef.length > 0;
+    if (!hasInline && !hasRef) {
+      return { ok: false, errors: ["Either telegramBotToken (inline) or telegramBotTokenRef (secret) is required"] };
     }
     return { ok: true };
   },
