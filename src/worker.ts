@@ -44,10 +44,20 @@ import { handleRegisterWatch, checkWatches } from "./watch-registry.js";
 import { METRIC_NAMES } from "./constants.js";
 import { EscalationManager } from "./escalation.js";
 import type { EscalationEvent } from "./escalation.js";
+import {
+  type HostApiConfig,
+  resolveCompanyId as resolveCompanyIdFromMap,
+  createIssue,
+  updateIssue,
+} from "./host-api.js";
 
 type TelegramConfig = {
   telegramBotTokenRef: string;
   telegramBotToken?: string;
+  // Inbound board-API token (see host-api.ts). HostApiConfig fields.
+  boardApiToken?: string;
+  boardApiTokenRef?: string;
+  defaultCompanyId?: string;
   defaultChatId: string;
   approvalsChatId: string;
   errorsChatId: string;
@@ -142,17 +152,11 @@ async function resolveChat(
   return (override as string) ?? fallback ?? null;
 }
 
-async function resolveCompanyId(ctx: PluginContext, chatId: string): Promise<string> {
-  let mapping: { companyId?: string; companyName?: string } | null = null;
-  try {
-    mapping = await ctx.state.get({
-      scopeKind: "instance",
-      stateKey: `chat_${chatId}`,
-    }) as { companyId?: string; companyName?: string } | null;
-  } catch {
-    mapping = null;
-  }
-  return mapping?.companyId ?? mapping?.companyName ?? chatId;
+// Resolve the company for an inbound chat without touching ctx.state (gated in
+// the poll loop). Uses the in-process /connect map, then config.defaultCompanyId,
+// then the chatId. See host-api.ts.
+function resolveCompanyId(config: HostApiConfig, chatId: string): string {
+  return resolveCompanyIdFromMap(chatId, config);
 }
 
 const plugin = definePlugin({
@@ -860,7 +864,7 @@ async function handleUpdate(
   // Phase 3: Handle media messages
   const hasMedia = !!(msg.voice || msg.audio || msg.video_note || msg.document || msg.photo);
   if (hasMedia) {
-    const companyId = await resolveCompanyId(ctx, chatId);
+    const companyId = resolveCompanyId(config, chatId);
     const handled = await handleMediaMessage(ctx, token, msg as Parameters<typeof handleMediaMessage>[2], {
       briefAgentId: config.briefAgentId ?? "",
       briefAgentChatIds: config.briefAgentChatIds ?? [],
@@ -878,7 +882,7 @@ async function handleUpdate(
   if (threadId) {
     const isCommand = text.startsWith("/");
     if (!isCommand) {
-      const companyId = await resolveCompanyId(ctx, chatId);
+      const companyId = resolveCompanyId(config, chatId);
       const replyToId = msg.reply_to_message?.message_id;
       const routed = await routeMessageToAgent(ctx, token, chatId, threadId, text, replyToId, companyId);
       if (routed) return;
@@ -890,7 +894,7 @@ async function handleUpdate(
     const fullCommand = text.slice(botCommand.offset, botCommand.offset + botCommand.length);
     const command = fullCommand.replace(/^\//, "").replace(/@.*$/, "");
     const args = text.slice(botCommand.offset + botCommand.length).trim();
-    const companyId = await resolveCompanyId(ctx, chatId);
+    const companyId = resolveCompanyId(config, chatId);
 
     // Phase 4: Check custom commands first
     if (command === "commands") {
@@ -901,8 +905,9 @@ async function handleUpdate(
     const handledCustom = await tryCustomCommand(ctx, token, chatId, command, args, threadId, companyId);
     if (handledCustom) return;
 
-    // Built-in commands
-    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl);
+    // Built-in commands. Pass config so the handlers reach the board REST API
+    // (the gated SDK host RPCs throw "unknown invocation scope" in the poll loop).
+    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, config);
     return;
   }
 
@@ -917,52 +922,26 @@ async function handleUpdate(
     !isReply &&
     isInboxChatAllowed(chatId, config.defaultChatId ?? "", config.inboxChatIds ?? []);
   if (isInboxEligible) {
-    const companyId = await resolveCompanyId(ctx, chatId);
-    const sender = msg.from?.username
-      ? `@${msg.from.username}`
-      : msg.from?.first_name ?? "Telegram user";
-    const shortBody = text.length > 140 ? text.slice(0, 137).trimEnd() + "…" : text;
-    const issueTitle = `[Inbox] ${shortBody.replace(/\s+/g, " ")}`;
-    const issueDescription = [
-      `From ${sender} via Telegram (chat ${chatId}, message ${msg.message_id}).`,
-      "",
-      text,
-    ].join("\n");
-    try {
-      const issue = await ctx.issues.create({
-        companyId,
-        title: issueTitle.length > 200 ? issueTitle.slice(0, 197) + "…" : issueTitle,
-        description: issueDescription,
-        assigneeAgentId: config.inboxAgentId,
-      });
-      await ctx.issues.update(issue.id, { status: "todo" }, companyId);
-      await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-      ctx.logger.info("Routed inbox message to agent via new issue", {
-        chatId,
-        agentId: config.inboxAgentId,
-        issueId: issue.id,
-      });
-      // Brief ack so the sender sees their message landed. Plain text to avoid
-      // MarkdownV2 escape pitfalls on arbitrary identifiers.
-      const ackLabel = issue.identifier ? String(issue.identifier) : issue.id;
-      await sendMessage(ctx, token, chatId, `Forwarded to agent — ${ackLabel}`, {});
-    } catch (err) {
-      ctx.logger.error("Failed to create inbox issue from Telegram", {
-        chatId,
-        agentId: config.inboxAgentId,
-        error: String(err),
-      });
-      await sendMessage(ctx, token, chatId, `Could not forward message: ${String(err)}`, {});
-    }
+    await handleInboxWake(ctx, token, config, msg, chatId, text);
     return;
   }
 
   if (config.enableInbound && msg.reply_to_message?.from?.is_bot) {
     const replyToId = msg.reply_to_message.message_id;
-    const mapping = await ctx.state.get({
-      scopeKind: "instance",
-      stateKey: `msg_${chatId}_${replyToId}`,
-    }) as { entityId: string; entityType: string; companyId: string } | null;
+    // The msg→entity map is written by notify() via ctx.state.set, which is
+    // gated in event handlers under the invocation-scope bug — so this lookup
+    // may throw or be empty. Degrade to "no mapping" instead of crashing the
+    // poll loop. (Restoring reply-to-comment fully needs the host scope fix or
+    // an in-memory msg map on the outbound side — tracked as a follow-up.)
+    let mapping: { entityId: string; entityType: string; companyId: string } | null = null;
+    try {
+      mapping = await ctx.state.get({
+        scopeKind: "instance",
+        stateKey: `msg_${chatId}_${replyToId}`,
+      }) as { entityId: string; entityType: string; companyId: string } | null;
+    } catch {
+      mapping = null;
+    }
 
     if (mapping && mapping.entityType === "escalation") {
       const escalationManager = new EscalationManager();
@@ -996,6 +975,64 @@ async function handleUpdate(
         });
       }
     }
+  }
+}
+
+/**
+ * Inbox wake: a plain top-level message from an allow-listed chat becomes a new
+ * issue assigned to config.inboxAgentId, so the agent wakes via the standard
+ * assignment path. Uses the board REST API (host-api) because ctx.issues is
+ * gated in the poll loop ("unknown invocation scope"). Exported for testing.
+ *
+ * The create-then-assign ordering is load-bearing: the issue_assigned wake only
+ * fires when the assignee transitions from null to an agent, so we create
+ * without an assignee and set it on the follow-up PATCH.
+ */
+export async function handleInboxWake(
+  ctx: PluginContext,
+  token: string,
+  config: TelegramConfig,
+  msg: NonNullable<TelegramUpdate["message"]>,
+  chatId: string,
+  text: string,
+): Promise<void> {
+  const companyId = resolveCompanyId(config, chatId);
+  const sender = msg.from?.username
+    ? `@${msg.from.username}`
+    : msg.from?.first_name ?? "Telegram user";
+  const shortBody = text.length > 140 ? text.slice(0, 137).trimEnd() + "…" : text;
+  const issueTitle = `[Inbox] ${shortBody.replace(/\s+/g, " ")}`;
+  const issueDescription = [
+    `From ${sender} via Telegram (chat ${chatId}, message ${msg.message_id}).`,
+    "",
+    text,
+  ].join("\n");
+  try {
+    const created = await createIssue(ctx, config as HostApiConfig, companyId, {
+      title: issueTitle.length > 200 ? issueTitle.slice(0, 197) + "…" : issueTitle,
+      description: issueDescription,
+    });
+    const issue = await updateIssue(ctx, config as HostApiConfig, created.id, {
+      status: "todo",
+      assigneeAgentId: config.inboxAgentId,
+    });
+    await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+    ctx.logger.info("Routed inbox message to agent via new issue", {
+      chatId,
+      agentId: config.inboxAgentId,
+      issueId: issue.id,
+    });
+    // Brief ack so the sender sees their message landed. Plain text to avoid
+    // MarkdownV2 escape pitfalls on arbitrary identifiers.
+    const ackLabel = issue.identifier ? String(issue.identifier) : issue.id;
+    await sendMessage(ctx, token, chatId, `Forwarded to agent — ${ackLabel}`, {});
+  } catch (err) {
+    ctx.logger.error("Failed to create inbox issue from Telegram", {
+      chatId,
+      agentId: config.inboxAgentId,
+      error: String(err),
+    });
+    await sendMessage(ctx, token, chatId, `Could not forward message: ${String(err)}`, {});
   }
 }
 

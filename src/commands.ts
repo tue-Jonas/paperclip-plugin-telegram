@@ -1,7 +1,20 @@
-import type { PluginContext, Agent, Issue } from "@paperclipai/plugin-sdk";
+import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { sendMessage, escapeMarkdownV2, sendChatAction } from "./telegram-api.js";
 import { METRIC_NAMES } from "./constants.js";
 import { handleAcpCommand } from "./acp-bridge.js";
+import {
+  type HostApiConfig,
+  type HostAgent,
+  type HostIssue,
+  listCompanies,
+  getCompany,
+  listAgents,
+  listIssues,
+  createIssue,
+  updateIssue,
+  setChatCompany,
+  resolveCompanyId,
+} from "./host-api.js";
 
 type BotCommand = {
   command: string;
@@ -30,21 +43,22 @@ export async function handleCommand(
   messageThreadId?: number,
   baseUrl?: string,
   publicUrl?: string,
+  config: HostApiConfig = {},
 ): Promise<void> {
   await ctx.metrics.write(METRIC_NAMES.commandsHandled, 1);
 
   switch (command) {
     case "create":
-      await handleCreate(ctx, token, chatId, args, messageThreadId, publicUrl || baseUrl);
+      await handleCreate(ctx, token, chatId, args, config, messageThreadId, publicUrl || baseUrl);
       break;
     case "status":
-      await handleStatus(ctx, token, chatId, messageThreadId, publicUrl);
+      await handleStatus(ctx, token, chatId, config, messageThreadId, publicUrl);
       break;
     case "issues":
-      await handleIssues(ctx, token, chatId, args, messageThreadId, publicUrl || baseUrl);
+      await handleIssues(ctx, token, chatId, args, config, messageThreadId, publicUrl || baseUrl);
       break;
     case "agents":
-      await handleAgents(ctx, token, chatId, messageThreadId, publicUrl);
+      await handleAgents(ctx, token, chatId, config, messageThreadId, publicUrl);
       break;
     case "approve":
       await handleApprove(ctx, token, chatId, args, messageThreadId, baseUrl);
@@ -53,7 +67,7 @@ export async function handleCommand(
       await handleHelp(ctx, token, chatId, messageThreadId);
       break;
     case "connect":
-      await handleConnect(ctx, token, chatId, args, messageThreadId);
+      await handleConnect(ctx, token, chatId, args, config, messageThreadId);
       break;
     case "connect_topic":
       await handleConnectTopic(ctx, token, chatId, args, messageThreadId);
@@ -76,17 +90,18 @@ async function handleStatus(
   ctx: PluginContext,
   token: string,
   chatId: string,
+  config: HostApiConfig,
   messageThreadId?: number,
   publicUrl?: string,
 ): Promise<void> {
   await sendChatAction(ctx, token, chatId);
 
   try {
-    const companyId = await resolveCompanyId(ctx, chatId);
-    const agents = await ctx.agents.list({ companyId });
-    const activeAgents = agents.filter((a: Agent) => a.status === "active");
-    const issues = await ctx.issues.list({ companyId, limit: 10 });
-    const doneIssues = issues.filter((i: Issue) => i.status === "done");
+    const companyId = resolveCompanyId(chatId, config);
+    const agents = await listAgents(ctx, config, companyId);
+    const activeAgents = agents.filter((a: HostAgent) => a.status === "active");
+    const issues = await listIssues(ctx, config, companyId, { limit: 10 });
+    const doneIssues = issues.filter((i: HostIssue) => i.status === "done");
 
     const lines = [
       escapeMarkdownV2("📊") + " *Paperclip Status*",
@@ -117,20 +132,20 @@ async function handleIssues(
   token: string,
   chatId: string,
   projectFilter: string,
+  config: HostApiConfig,
   messageThreadId?: number,
   baseUrl?: string,
 ): Promise<void> {
   await sendChatAction(ctx, token, chatId);
 
   try {
-    const companyId = await resolveCompanyId(ctx, chatId);
-    const company = await ctx.companies.get(companyId);
-    const issues = await ctx.issues.list({ companyId, limit: 10 });
+    const companyId = resolveCompanyId(chatId, config);
+    const company = await getCompany(ctx, config, companyId);
+    const issues = await listIssues(ctx, config, companyId, { limit: 10 });
+    // The board REST issue payload carries projectId (not a nested project
+    // name), so a project filter matches against the project id.
     const filtered = projectFilter
-      ? issues.filter((i: Issue) => {
-          const projName = i.project?.name ?? "";
-          return projName.toLowerCase().includes(projectFilter.toLowerCase());
-        })
+      ? issues.filter((i: HostIssue) => (i.projectId ?? "") === projectFilter)
       : issues;
 
     if (filtered.length === 0) {
@@ -171,14 +186,15 @@ async function handleAgents(
   ctx: PluginContext,
   token: string,
   chatId: string,
+  config: HostApiConfig,
   messageThreadId?: number,
   publicUrl?: string,
 ): Promise<void> {
   await sendChatAction(ctx, token, chatId);
 
   try {
-    const companyId = await resolveCompanyId(ctx, chatId);
-    const agents = await ctx.agents.list({ companyId });
+    const companyId = resolveCompanyId(chatId, config);
+    const agents = await listAgents(ctx, config, companyId);
 
     if (agents.length === 0) {
       await sendMessage(ctx, token, chatId, "No agents found.", { messageThreadId });
@@ -281,11 +297,12 @@ async function handleConnect(
   token: string,
   chatId: string,
   companyArg: string,
+  config: HostApiConfig,
   messageThreadId?: number,
 ): Promise<void> {
   if (!companyArg.trim()) {
     try {
-      const companies = await ctx.companies.list();
+      const companies = await listCompanies(ctx, config);
       const names = companies.map((c) => c.name || c.id).join(", ");
       await sendMessage(ctx, token, chatId, `Usage: /connect <company-name>\nAvailable: ${names || "none"}`, { messageThreadId });
     } catch {
@@ -296,7 +313,7 @@ async function handleConnect(
 
   try {
     const input = companyArg.trim();
-    const companies = await ctx.companies.list();
+    const companies = await listCompanies(ctx, config);
     const match = companies.find(
       (c) =>
         c.id === input ||
@@ -315,17 +332,23 @@ async function handleConnect(
       return;
     }
 
-    // Inbound: chat → company (for commands like /status)
-    await ctx.state.set(
-      { scopeKind: "instance", stateKey: `chat_${chatId}` },
-      { companyId: match.id, companyName: match.name ?? input, linkedAt: new Date().toISOString() },
-    );
+    // Inbound: chat → company (for commands like /status). Persist in-process
+    // (host state is unreadable from the poll loop under the scope bug).
+    setChatCompany(chatId, match.id, match.name ?? input);
 
-    // Outbound: company → chat (for notifications)
-    await ctx.state.set(
-      { scopeKind: "company", scopeId: match.id, stateKey: "telegram-chat" },
-      chatId,
-    );
+    // Best-effort durable writes: these will succeed once the host propagates
+    // an invocation scope into the poll loop (Option 1 / fork-core fix). Until
+    // then they throw and we rely on the in-process map + defaultCompanyId.
+    try {
+      await ctx.state.set(
+        { scopeKind: "instance", stateKey: `chat_${chatId}` },
+        { companyId: match.id, companyName: match.name ?? input, linkedAt: new Date().toISOString() },
+      );
+      await ctx.state.set(
+        { scopeKind: "company", scopeId: match.id, stateKey: "telegram-chat" },
+        chatId,
+      );
+    } catch { /* best effort — gated until host scope fix lands */ }
 
     await sendMessage(
       ctx,
@@ -352,6 +375,7 @@ async function handleCreate(
   token: string,
   chatId: string,
   titleArg: string,
+  config: HostApiConfig,
   messageThreadId?: number,
   linkBaseUrl?: string,
 ): Promise<void> {
@@ -364,28 +388,27 @@ async function handleCreate(
   await sendChatAction(ctx, token, chatId);
 
   try {
-    const companyId = await resolveCompanyId(ctx, chatId);
-    const company = await ctx.companies.get(companyId);
+    const companyId = resolveCompanyId(chatId, config);
+    const company = await getCompany(ctx, config, companyId);
     const issuePrefix = company?.issuePrefix;
 
     // Find the CEO agent to assign to
-    const agents = await ctx.agents.list({ companyId });
-    const ceo = agents.find((a: Agent) => a.role === "ceo" && a.status !== "paused" && a.status !== "error");
+    const agents = await listAgents(ctx, config, companyId);
+    const ceo = agents.find((a: HostAgent) => a.role === "ceo" && a.status !== "paused" && a.status !== "error");
 
     // Create the issue WITHOUT assignee first, then update with both status and assignee.
     // This ordering is load-bearing: the issue_assigned wake only fires when the assignee
     // *transitions* from null to an agent. If we set the assignee at creation time, there's
     // no transition and the agent never gets woken.
-    let issue = await ctx.issues.create({ companyId, title });
+    let issue = await createIssue(ctx, config, companyId, { title });
     if (ceo) {
-      issue = await ctx.issues.update(
-        issue.id,
-        { status: "todo", assigneeAgentId: ceo.id },
-        companyId,
-      );
+      issue = await updateIssue(ctx, config, issue.id, {
+        status: "todo",
+        assigneeAgentId: ceo.id,
+      });
     } else {
       // No CEO to assign to — still bump status to todo so it's visible in the backlog
-      issue = await ctx.issues.update(issue.id, { status: "todo" }, companyId);
+      issue = await updateIssue(ctx, config, issue.id, { status: "todo" });
     }
 
     const id = issue.identifier ?? issue.id;
@@ -432,18 +455,31 @@ export async function handleConnectTopic(
   const topicId = parts.pop()!;
   const projectName = parts.join(" ");
 
-  const existing = (await ctx.state.get({
-    scopeKind: "instance",
-    stateKey: `topic-map-${chatId}`,
-  })) as Record<string, string> | null;
+  // Topic-map persistence uses ctx.state, which is gated in the poll loop on
+  // hosts without an invocation scope. Degrade gracefully instead of throwing.
+  try {
+    const existing = (await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `topic-map-${chatId}`,
+    })) as Record<string, string> | null;
 
-  const topicMap = existing ?? {};
-  topicMap[projectName] = topicId;
+    const topicMap = existing ?? {};
+    topicMap[projectName] = topicId;
 
-  await ctx.state.set(
-    { scopeKind: "instance", stateKey: `topic-map-${chatId}` },
-    topicMap,
-  );
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: `topic-map-${chatId}` },
+      topicMap,
+    );
+  } catch {
+    await sendMessage(
+      ctx,
+      token,
+      chatId,
+      "Topic mapping is unavailable on this server build (plugin state is gated). Forum topic routing requires the host invocation-scope fix.",
+      { messageThreadId },
+    );
+    return;
+  }
 
   await sendMessage(
     ctx,
@@ -462,19 +498,18 @@ export async function getTopicForProject(
   projectName?: string,
 ): Promise<number | undefined> {
   if (!projectName) return undefined;
-  const topicMap = (await ctx.state.get({
-    scopeKind: "instance",
-    stateKey: `topic-map-${chatId}`,
-  })) as Record<string, string> | null;
+  // ctx.state may be gated in the poll loop / event handlers; degrade to "no
+  // topic mapping" rather than throwing out of notify().
+  let topicMap: Record<string, string> | null = null;
+  try {
+    topicMap = (await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `topic-map-${chatId}`,
+    })) as Record<string, string> | null;
+  } catch {
+    return undefined;
+  }
   if (!topicMap) return undefined;
   const topicId = topicMap[projectName];
   return topicId ? Number(topicId) : undefined;
-}
-
-async function resolveCompanyId(ctx: PluginContext, chatId: string): Promise<string> {
-  const mapping = await ctx.state.get({
-    scopeKind: "instance",
-    stateKey: `chat_${chatId}`,
-  }) as { companyId?: string; companyName?: string } | null;
-  return mapping?.companyId ?? mapping?.companyName ?? chatId;
 }

@@ -70,6 +70,28 @@ const manifest: PaperclipPluginManifestV1 = {
           "Public URL for issue links in Telegram messages (e.g. https://pc.example.com). Falls back to API URL if empty.",
         default: DEFAULT_CONFIG.paperclipPublicUrl,
       },
+      boardApiToken: {
+        type: "string",
+        title: "Board API Token (inline)",
+        description:
+          "Board API token (pcp_board_…) used for INBOUND commands and inbox-wake. Required on host builds that don't propagate an invocation scope into the poll loop, where the gated SDK host RPCs (companies/agents/issues/state) throw 'unknown invocation scope'. Calls go to paperclipBaseUrl via ctx.http.fetch with this bearer token. Prefer boardApiTokenRef when the host supports plugin secret references.",
+        default: DEFAULT_CONFIG.boardApiToken,
+      },
+      boardApiTokenRef: {
+        type: "string",
+        format: "secret-ref",
+        title: "Board API Token (secret reference)",
+        description:
+          "Secret UUID for the board API token. Resolved via the un-gated ctx.secrets.resolve. Used if boardApiToken (inline) is empty.",
+        default: DEFAULT_CONFIG.boardApiTokenRef,
+      },
+      defaultCompanyId: {
+        type: "string",
+        title: "Default Company ID",
+        description:
+          "Company used to resolve inbound commands + inbox-wake for chats that haven't run /connect (host state is unreadable from the poll loop under the invocation-scope bug). Set this to your primary company id.",
+        default: DEFAULT_CONFIG.defaultCompanyId,
+      },
 
       // --- Chat routing ---
       defaultChatId: {
