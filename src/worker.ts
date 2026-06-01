@@ -1152,11 +1152,29 @@ async function handleUpdate(
   if (config.enableInbound && msg.reply_to_message?.from?.is_bot) {
     const replyToId = msg.reply_to_message.message_id;
     const inboundKey = `inbound_${chatId}_${msg.message_id}`;
-    const alreadyProcessed = await ctx.state.get({
-      scopeKind: "instance",
-      stateKey: inboundKey,
-    });
+    // Dedup state reads are best-effort under host-gated runtimes. If this
+    // throws, treat it as "not processed yet" so inbound routing still runs.
+    let alreadyProcessed: unknown = null;
+    try {
+      alreadyProcessed = await ctx.state.get({
+        scopeKind: "instance",
+        stateKey: inboundKey,
+      });
+    } catch {
+      alreadyProcessed = null;
+    }
     if (alreadyProcessed) return;
+
+    const markInboundRouted = async () => {
+      try {
+        await ctx.state.set(
+          { scopeKind: "instance", stateKey: inboundKey },
+          { routedAt: new Date().toISOString() },
+        );
+      } catch {
+        // best effort
+      }
+    };
 
     // The msg→entity map is written by notify() via ctx.state.set, which is
     // gated in event handlers under the invocation-scope bug — so this lookup
@@ -1186,7 +1204,7 @@ async function handleUpdate(
         escalationId: mapping.entityId,
         from: msg.from?.username,
       });
-      await ctx.state.set({ scopeKind: "instance", stateKey: inboundKey }, { routedAt: new Date().toISOString() });
+      await markInboundRouted();
     } else if (mapping && mapping.entityType === "issue") {
       try {
         await ctx.issues.createComment(
@@ -1199,7 +1217,7 @@ async function handleUpdate(
           issueId: mapping.entityId,
           from: msg.from?.username,
         });
-        await ctx.state.set({ scopeKind: "instance", stateKey: inboundKey }, { routedAt: new Date().toISOString() });
+        await markInboundRouted();
       } catch (err) {
         ctx.logger.error("Failed to route inbound message", {
           issueId: mapping.entityId,
@@ -1219,7 +1237,7 @@ async function handleUpdate(
           issueId: mapping.issueId,
           from: msg.from?.username,
         });
-        await ctx.state.set({ scopeKind: "instance", stateKey: inboundKey }, { routedAt: new Date().toISOString() });
+        await markInboundRouted();
       } catch (err) {
         ctx.logger.error("Failed to route approval reply to issue comment", {
           approvalId: mapping.approvalId ?? mapping.entityId,
@@ -1293,7 +1311,7 @@ async function handleUpdate(
           return;
         }
         await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-        await ctx.state.set({ scopeKind: "instance", stateKey: inboundKey }, { routedAt: new Date().toISOString() });
+        await markInboundRouted();
       } catch (err) {
         ctx.logger.error("Failed to route interaction reply", {
           issueId: mapping.issueId,
