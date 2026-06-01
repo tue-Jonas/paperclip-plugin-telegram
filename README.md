@@ -158,6 +158,8 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
 | `escalationChatId` | No | Dedicated chat for agent escalations |
 | `paperclipBaseUrl` | No | Internal Paperclip API URL (default: http://localhost:3100) |
 | `paperclipPublicUrl` | No | Public URL for issue links in messages |
+| `boardApiToken` | No | Inline `pcp_board_...` token used for approval callbacks (advanced) |
+| `boardApiTokenRef` | No | Secret reference for board API token (preferred over inline token) |
 | `enableCommands` | No | Enable bot commands (default: true) |
 | `enableInbound` | No | Route Telegram replies to issues (default: true) |
 | `topicRouting` | No | Map forum topics to projects (default: false) |

@@ -8,6 +8,8 @@ export const DEFAULT_CONFIG = {
   errorsChatId: "",
   paperclipBaseUrl: "http://localhost:3100",
   paperclipPublicUrl: "",
+  boardApiToken: "",
+  boardApiTokenRef: "",
   notifyOnIssueCreated: true,
   notifyOnIssueDone: true,
   notifyOnApprovalCreated: true,
