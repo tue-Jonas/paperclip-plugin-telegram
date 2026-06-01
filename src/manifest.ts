@@ -74,7 +74,7 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "string",
         title: "Board API Token (inline)",
         description:
-          "Board API token (pcp_board_…) used for INBOUND commands and inbox-wake. Required on host builds that don't propagate an invocation scope into the poll loop, where the gated SDK host RPCs (companies/agents/issues/state) throw 'unknown invocation scope'. Calls go to paperclipBaseUrl via ctx.http.fetch with this bearer token. Prefer boardApiTokenRef when the host supports plugin secret references.",
+          "Inline Paperclip board API token (pcp_board_...). Used for approval callbacks plus inbound commands/inbox-wake on host builds that don't propagate an invocation scope into the poll loop. Prefer boardApiTokenRef when the host supports plugin secret references.",
         default: DEFAULT_CONFIG.boardApiToken,
       },
       boardApiTokenRef: {

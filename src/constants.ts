@@ -9,11 +9,11 @@ export const DEFAULT_CONFIG = {
   errorsChatId: "",
   paperclipBaseUrl: "http://localhost:3100",
   paperclipPublicUrl: "",
+  boardApiToken: "",
+  boardApiTokenRef: "",
   // Inbound board-API token. Required for inbound commands + inbox-wake on host
   // builds that don't propagate an invocation scope into the poll loop (gated
   // SDK host RPCs throw "unknown invocation scope"). See host-api.ts.
-  boardApiToken: "",
-  boardApiTokenRef: "",
   defaultCompanyId: "",
   notifyOnIssueCreated: true,
   notifyOnIssueDone: true,

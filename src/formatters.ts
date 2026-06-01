@@ -23,6 +23,20 @@ function code(s: string): string {
 
 export type IssueLinksOpts = { baseUrl?: string; issuePrefix?: string };
 
+type InteractionOption = {
+  id: string;
+  label: string;
+  description?: string | null;
+};
+
+type InteractionQuestion = {
+  id: string;
+  prompt: string;
+  selectionMode: "single" | "multi";
+  options: InteractionOption[];
+  required?: boolean;
+};
+
 function isExternalUrl(url?: string): boolean {
   return !!url && url.startsWith("https://");
 }
@@ -40,6 +54,83 @@ function issueButton(identifier: string, opts?: IssueLinksOpts): { text: string;
     return { text: `Open ${identifier} ↗`, url: `${opts.baseUrl}/${opts.issuePrefix}/issues/${identifier}` };
   }
   return null;
+}
+
+function asPayload(value: unknown): Payload {
+  return value && typeof value === "object" ? (value as Payload) : {};
+}
+
+function stringOrNull(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function firstNonEmptyString(source: Payload, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return null;
+}
+
+function normalizeStringList(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => {
+        if (typeof entry === "string") return entry.trim();
+        if (entry && typeof entry === "object") {
+          const payload = entry as Payload;
+          return firstNonEmptyString(payload, ["label", "title", "text", "value"]) ?? "";
+        }
+        return "";
+      })
+      .filter((entry) => entry.length > 0);
+  }
+  if (typeof value === "string" && value.trim().length > 0) {
+    return value.split("\n").map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+  }
+  return [];
+}
+
+function formatOptionList(options: string[]): string | null {
+  if (options.length === 0) return null;
+  const preview = options.slice(0, 6).map((option) => `• ${esc(option)}`);
+  if (options.length > 6) preview.push(`• ${esc(`+${String(options.length - 6)} more`)}`);
+  return preview.join("\n");
+}
+
+function parseInteractionQuestions(value: unknown): InteractionQuestion[] {
+  if (!Array.isArray(value)) return [];
+  const questions: InteractionQuestion[] = [];
+  for (const rawQuestion of value) {
+    const q = asPayload(rawQuestion);
+    const id = firstNonEmptyString(q, ["id"]) ?? "";
+    const prompt = firstNonEmptyString(q, ["prompt"]) ?? "";
+    if (!id || !prompt) continue;
+    const selectionMode =
+      q.selectionMode === "multi" ? "multi" : "single";
+    const optionsRaw = Array.isArray(q.options) ? q.options : [];
+    const options: InteractionOption[] = [];
+    for (const rawOption of optionsRaw) {
+      const option = asPayload(rawOption);
+      const optionId = firstNonEmptyString(option, ["id"]) ?? "";
+      const label = firstNonEmptyString(option, ["label"]) ?? "";
+      if (!optionId || !label) continue;
+      options.push({
+        id: optionId,
+        label,
+        description: stringOrNull(option.description),
+      });
+    }
+    if (options.length === 0) continue;
+    questions.push({
+      id,
+      prompt,
+      selectionMode,
+      options,
+      required: q.required === true,
+    });
+  }
+  return questions;
 }
 
 function agentButton(agentId: string, label: string, publicUrl?: string): { text: string; url: string } | null {
@@ -116,21 +207,43 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
   const approvalType = String(p.type ?? "unknown");
   const approvalId = String(p.approvalId ?? event.entityId);
   const title = String(p.title ?? "Approval Requested");
-  const description = p.description ? String(p.description) : null;
+  const detailPayload = asPayload(p.approvalPayload);
+  const prompt = firstNonEmptyString(detailPayload, ["prompt", "title", "question", "whatIsBeingAsked"])
+    ?? stringOrNull(p.description)
+    ?? title;
+  const summary = firstNonEmptyString(detailPayload, ["summary", "why", "reason", "rationale"]);
+  const detailsMarkdown = firstNonEmptyString(detailPayload, ["detailsMarkdown", "details"]);
+  const recommendedDefault = firstNonEmptyString(detailPayload, [
+    "recommendedDefault",
+    "recommendedAction",
+    "recommendedOption",
+    "recommended",
+  ]);
+  const risks = normalizeStringList(detailPayload.risks);
+  const options = normalizeStringList(detailPayload.options);
+  const acceptLabel = firstNonEmptyString(detailPayload, ["acceptLabel", "approveLabel"]) ?? "Approve";
+  const rejectLabel = firstNonEmptyString(detailPayload, ["rejectLabel", "declineLabel"]) ?? "Reject";
   const agentName = p.agentName ? String(p.agentName) : null;
 
   const lines: string[] = [
     `${esc("🔔")} ${bold("Approval Requested")}`,
-    bold(title),
+    `${bold("Request")}: ${esc(prompt)}`,
   ];
 
-  if (agentName) lines.push(`Agent: ${esc(agentName)} \\| Type: ${code(approvalType)}`);
-  if (description) lines.push(`\n${esc(truncateAtWord(description, 300))}`);
+  lines.push(`${bold("Type")}: ${code(approvalType)}`);
+  if (agentName) lines.push(`${bold("Requested By")}: ${esc(agentName)}`);
+  if (summary) lines.push(`${bold("Summary / Why")}: ${esc(truncateAtWord(summary, 500))}`);
+  if (detailsMarkdown) lines.push(`${bold("Details")}: ${esc(truncateAtWord(detailsMarkdown, 500))}`);
+  const optionsBlock = formatOptionList(options);
+  if (optionsBlock) lines.push(`${bold("Options")}:\n${optionsBlock}`);
+  if (recommendedDefault) lines.push(`${bold("Recommended Default")}: ${esc(recommendedDefault)}`);
+  const risksBlock = formatOptionList(risks);
+  if (risksBlock) lines.push(`${bold("Risks")}:\n${risksBlock}`);
 
   // Add linked issues if present
   const linkedIssues = Array.isArray(p.linkedIssues) ? p.linkedIssues as Array<Payload> : [];
   if (linkedIssues.length > 0) {
-    lines.push(`\n${bold(`Linked Issues (${String(linkedIssues.length)})`)}`);
+    lines.push(`\n${bold("Issue Context")}`);
     for (const issue of linkedIssues.slice(0, 5)) {
       const issueId = String(issue.identifier ?? "?");
       const issueParts = [`${issueLink(issueId, opts)} ${esc(String(issue.title ?? ""))}`];
@@ -145,8 +258,8 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
 
   const keyboard: Array<Array<{ text: string; callback_data?: string; url?: string }>> = [
     [
-      { text: "Approve", callback_data: `approve_${approvalId}` },
-      { text: "Reject", callback_data: `reject_${approvalId}` },
+      { text: acceptLabel, callback_data: `approve_${approvalId}` },
+      { text: rejectLabel, callback_data: `reject_${approvalId}` },
     ],
   ];
 
@@ -164,6 +277,64 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
     options: {
       parseMode: "MarkdownV2",
       inlineKeyboard: keyboard,
+    },
+  };
+}
+
+export function formatInteractionCreated(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
+  const p = event.payload as Payload;
+  const interactionId = String(p.interactionId ?? "interaction");
+  const kind = String(p.interactionKind ?? "unknown");
+  const issueIdentifier = String(p.issueIdentifier ?? event.entityId);
+  const issueTitle = stringOrNull(p.issueTitle);
+  const interaction = asPayload(p.interaction);
+  const interactionPayload = asPayload(interaction.payload);
+
+  const lines: string[] = [
+    `${esc("💬")} ${bold("Decision Interaction")}`,
+    `${bold("Issue")}: ${issueLink(issueIdentifier, opts)}${issueTitle ? ` ${esc(issueTitle)}` : ""}`,
+    `${bold("Kind")}: ${code(kind)}`,
+  ];
+
+  const keyboard: Array<Array<{ text: string; callback_data?: string; url?: string }>> = [];
+
+  if (kind === "request_confirmation") {
+    const prompt = firstNonEmptyString(interactionPayload, ["prompt"]) ?? "Please confirm this action.";
+    const details = firstNonEmptyString(interactionPayload, ["detailsMarkdown"]);
+    const acceptLabel = firstNonEmptyString(interactionPayload, ["acceptLabel"]) ?? "Accept";
+    const rejectLabel = firstNonEmptyString(interactionPayload, ["rejectLabel"]) ?? "Reject";
+    lines.push(`${bold("Prompt")}: ${esc(prompt)}`);
+    if (details) lines.push(`${bold("Details")}: ${esc(truncateAtWord(details, 600))}`);
+    keyboard.push([
+      { text: acceptLabel, callback_data: "interaction_accept" },
+      { text: rejectLabel, callback_data: "interaction_reject" },
+    ]);
+  } else if (kind === "ask_user_questions") {
+    const title = firstNonEmptyString(interactionPayload, ["title"]) ?? "Please answer the questions below.";
+    const questions = parseInteractionQuestions(interactionPayload.questions);
+    lines.push(`${bold("Prompt")}: ${esc(title)}`);
+    for (const question of questions.slice(0, 4)) {
+      lines.push(`\n${bold(question.id)}: ${esc(question.prompt)}`);
+      for (const option of question.options.slice(0, 6)) {
+        lines.push(`• ${esc(option.id)} = ${esc(option.label)}`);
+      }
+      if (question.options.length > 6) lines.push(`• ${esc(`+${String(question.options.length - 6)} more`)}`);
+    }
+    lines.push(
+      `\n${esc("Reply format")}: ${code("question_id=option_id[,option_id]")}`,
+    );
+  } else {
+    lines.push(`${bold("Interaction ID")}: ${code(interactionId)}`);
+  }
+
+  const issueLinkButton = issueButton(issueIdentifier, opts);
+  if (issueLinkButton) keyboard.push([issueLinkButton]);
+
+  return {
+    text: lines.join("\n"),
+    options: {
+      parseMode: "MarkdownV2",
+      ...(keyboard.length > 0 ? { inlineKeyboard: keyboard } : {}),
     },
   };
 }
