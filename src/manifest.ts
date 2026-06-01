@@ -63,6 +63,21 @@ const manifest: PaperclipPluginManifestV1 = {
           "Public URL for issue links in Telegram messages (e.g. https://pc.example.com). Falls back to API URL if empty.",
         default: DEFAULT_CONFIG.paperclipPublicUrl,
       },
+      boardApiToken: {
+        type: "string",
+        title: "Board API Token (advanced)",
+        description:
+          "Inline Paperclip board API token (pcp_board_...). Used by approval callbacks when the host requires Authorization headers.",
+        default: DEFAULT_CONFIG.boardApiToken,
+      },
+      boardApiTokenRef: {
+        type: "string",
+        format: "secret-ref",
+        title: "Board API Token (secret reference)",
+        description:
+          "Secret UUID for a Paperclip board API token. Preferred over inline token.",
+        default: DEFAULT_CONFIG.boardApiTokenRef,
+      },
 
       // --- Chat routing ---
       defaultChatId: {
