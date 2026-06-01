@@ -125,19 +125,33 @@ async function resolveChat(
   companyId: string,
   fallback: string,
 ): Promise<string | null> {
-  const override = await ctx.state.get({
-    scopeKind: "company",
-    scopeId: companyId,
-    stateKey: "telegram-chat",
-  });
+  // Per-company routing override is best-effort: some host builds reject
+  // gated state reads inside event handlers ("unknown invocation scope").
+  // In that case fall back to the configured default chat so notifications
+  // still deliver.
+  let override: unknown;
+  try {
+    override = await ctx.state.get({
+      scopeKind: "company",
+      scopeId: companyId,
+      stateKey: "telegram-chat",
+    });
+  } catch {
+    override = undefined;
+  }
   return (override as string) ?? fallback ?? null;
 }
 
 async function resolveCompanyId(ctx: PluginContext, chatId: string): Promise<string> {
-  const mapping = await ctx.state.get({
-    scopeKind: "instance",
-    stateKey: `chat_${chatId}`,
-  }) as { companyId?: string; companyName?: string } | null;
+  let mapping: { companyId?: string; companyName?: string } | null = null;
+  try {
+    mapping = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `chat_${chatId}`,
+    }) as { companyId?: string; companyName?: string } | null;
+  } catch {
+    mapping = null;
+  }
   return mapping?.companyId ?? mapping?.companyName ?? chatId;
 }
 
@@ -235,9 +249,16 @@ const plugin = definePlugin({
     async function resolveIssueLinksOpts(companyId: string): Promise<IssueLinksOpts> {
       let prefix = issuePrefixCache.get(companyId);
       if (!prefix) {
-        const company = await ctx.companies.get(companyId);
-        prefix = company?.issuePrefix ?? "";
-        if (prefix) issuePrefixCache.set(companyId, prefix);
+        // Best-effort: gated company reads can fail inside event handlers on
+        // hosts that don't propagate an invocation scope. Degrade to no prefix
+        // (links still work via baseUrl) rather than dropping the notification.
+        try {
+          const company = await ctx.companies.get(companyId);
+          prefix = company?.issuePrefix ?? "";
+          if (prefix) issuePrefixCache.set(companyId, prefix);
+        } catch {
+          prefix = "";
+        }
       }
       return { baseUrl: publicUrl, issuePrefix: prefix || undefined };
     }
@@ -274,25 +295,33 @@ const plugin = definePlugin({
       const messageId = await sendMessage(ctx, token, chatId, msg.text, msg.options);
 
       if (messageId) {
-        await ctx.state.set(
-          {
-            scopeKind: "instance",
-            stateKey: `msg_${chatId}_${messageId}`,
-          },
-          {
-            entityId: event.entityId,
-            entityType: event.entityType,
-            companyId: event.companyId,
-            eventType: event.eventType,
-          },
-        );
+        // Reply-routing map + activity log are best-effort: gated writes can be
+        // rejected on hosts without an invocation scope in event handlers. The
+        // notification itself has already been delivered, so never let these
+        // throw out of notify().
+        try {
+          await ctx.state.set(
+            {
+              scopeKind: "instance",
+              stateKey: `msg_${chatId}_${messageId}`,
+            },
+            {
+              entityId: event.entityId,
+              entityType: event.entityType,
+              companyId: event.companyId,
+              eventType: event.eventType,
+            },
+          );
+        } catch { /* best effort */ }
 
-        await ctx.activity.log({
-          companyId: event.companyId,
-          message: `Forwarded ${event.eventType} to Telegram`,
-          entityType: "plugin",
-          entityId: event.entityId,
-        });
+        try {
+          await ctx.activity.log({
+            companyId: event.companyId,
+            message: `Forwarded ${event.eventType} to Telegram`,
+            entityType: "plugin",
+            entityId: event.entityId,
+          });
+        } catch { /* best effort */ }
       }
     };
 
