@@ -1,6 +1,7 @@
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import { escapeMarkdownV2, truncateAtWord } from "./telegram-api.js";
 import type { SendMessageOptions } from "./telegram-api.js";
+import { buildInteractionCallbackData } from "./interaction-callback-data.js";
 
 type Payload = Record<string, unknown>;
 
@@ -285,6 +286,7 @@ export function formatInteractionCreated(event: PluginEvent, opts?: IssueLinksOp
   const p = event.payload as Payload;
   const interactionId = String(p.interactionId ?? "interaction");
   const kind = String(p.interactionKind ?? "unknown");
+  const issueId = String(event.entityId ?? "");
   const issueIdentifier = String(p.issueIdentifier ?? event.entityId);
   const issueTitle = stringOrNull(p.issueTitle);
   const interaction = asPayload(p.interaction);
@@ -305,9 +307,11 @@ export function formatInteractionCreated(event: PluginEvent, opts?: IssueLinksOp
     const rejectLabel = firstNonEmptyString(interactionPayload, ["rejectLabel"]) ?? "Reject";
     lines.push(`${bold("Prompt")}: ${esc(prompt)}`);
     if (details) lines.push(`${bold("Details")}: ${esc(truncateAtWord(details, 600))}`);
+    const acceptData = buildInteractionCallbackData("accept", issueId, interactionId) ?? "interaction_accept";
+    const rejectData = buildInteractionCallbackData("reject", issueId, interactionId) ?? "interaction_reject";
     keyboard.push([
-      { text: acceptLabel, callback_data: "interaction_accept" },
-      { text: rejectLabel, callback_data: "interaction_reject" },
+      { text: acceptLabel, callback_data: acceptData },
+      { text: rejectLabel, callback_data: rejectData },
     ]);
   } else if (kind === "ask_user_questions") {
     const title = firstNonEmptyString(interactionPayload, ["title"]) ?? "Please answer the questions below.";
@@ -322,6 +326,9 @@ export function formatInteractionCreated(event: PluginEvent, opts?: IssueLinksOp
     }
     lines.push(
       `\n${esc("Reply format")}: ${code("question_id=option_id[,option_id]")}`,
+    );
+    lines.push(
+      `${esc("Example")}:\n${code("scope=all")}\n${code("region=eu,us")}`,
     );
   } else {
     lines.push(`${bold("Interaction ID")}: ${code(interactionId)}`);

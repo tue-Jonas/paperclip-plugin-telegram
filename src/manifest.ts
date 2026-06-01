@@ -78,6 +78,14 @@ const manifest: PaperclipPluginManifestV1 = {
           "Secret UUID for a Paperclip board API token. Preferred over inline token.",
         default: DEFAULT_CONFIG.boardApiTokenRef,
       },
+      allowedDecisionUsernames: {
+        type: "array",
+        items: { type: "string" },
+        title: "Allowed Telegram usernames (decision actions)",
+        description:
+          "Optional allowlist for approval/interaction decisions. When set, only these usernames may approve/reject/respond via Telegram.",
+        default: DEFAULT_CONFIG.allowedDecisionUsernames,
+      },
 
       // --- Chat routing ---
       defaultChatId: {

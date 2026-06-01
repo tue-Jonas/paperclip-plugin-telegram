@@ -10,6 +10,7 @@ export const DEFAULT_CONFIG = {
   paperclipPublicUrl: "",
   boardApiToken: "",
   boardApiTokenRef: "",
+  allowedDecisionUsernames: [] as string[],
   notifyOnIssueCreated: true,
   notifyOnIssueDone: true,
   notifyOnApprovalCreated: true,

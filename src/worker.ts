@@ -43,11 +43,13 @@ import { EscalationManager } from "./escalation.js";
 import type { EscalationEvent } from "./escalation.js";
 import { fetchApprovalContext, submitApprovalDecision } from "./approvals-api.js";
 import { fetchInteraction, respondInteraction } from "./interactions-api.js";
+import { parseInteractionCallbackData } from "./interaction-callback-data.js";
 
 type TelegramConfig = {
   telegramBotTokenRef: string;
   boardApiToken?: string;
   boardApiTokenRef?: string;
+  allowedDecisionUsernames?: string[];
   defaultChatId: string;
   approvalsChatId: string;
   errorsChatId: string;
@@ -128,6 +130,34 @@ type StoredMessageMapping = {
     options: Array<{ id: string; label: string }>;
   }>;
 };
+
+function normalizeTelegramUsername(raw: string): string | null {
+  const trimmed = raw.trim().toLowerCase();
+  if (!trimmed) return null;
+  return trimmed.startsWith("@") ? trimmed.slice(1) : trimmed;
+}
+
+function buildDecisionAllowlist(config: TelegramConfig): ReadonlySet<string> {
+  const raw = Array.isArray(config.allowedDecisionUsernames) ? config.allowedDecisionUsernames : [];
+  const normalized = raw
+    .map((entry) => (typeof entry === "string" ? normalizeTelegramUsername(entry) : null))
+    .filter((entry): entry is string => Boolean(entry));
+  return new Set(normalized);
+}
+
+function isDecisionActorAllowed(
+  from: { username?: string; id: number; first_name?: string },
+  allowlist: ReadonlySet<string>,
+): boolean {
+  if (allowlist.size === 0) return true;
+  const normalized = from.username ? normalizeTelegramUsername(from.username) : null;
+  if (!normalized) return false;
+  return allowlist.has(normalized);
+}
+
+function describeDecisionActor(from: { username?: string; id: number; first_name?: string }): string {
+  return from.username ? `@${from.username}` : from.first_name ?? String(from.id);
+}
 
 function toRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {};
@@ -218,6 +248,7 @@ const plugin = definePlugin({
     const rawConfig = await ctx.config.get();
     ctx.logger.info("Telegram plugin config loaded");
     const config = rawConfig as unknown as TelegramConfig;
+    const decisionAllowlist = buildDecisionAllowlist(config);
     const baseUrl = config.paperclipBaseUrl || "http://localhost:3100";
     const publicUrl = config.paperclipPublicUrl || baseUrl;
 
@@ -286,6 +317,7 @@ const plugin = definePlugin({
                 baseUrl,
                 publicUrl,
                 boardApiToken,
+                decisionAllowlist,
               );
             }
           }
@@ -447,7 +479,10 @@ const plugin = definePlugin({
 
         // Enrich with linked issue details (event only has issueIds)
         const issueIds = Array.isArray(payload.issueIds) ? payload.issueIds as string[] : [];
-        if (issueIds.length > 0 && !payload.linkedIssues) {
+        const existingLinkedIssues = Array.isArray(payload.linkedIssues)
+          ? payload.linkedIssues.filter((entry) => entry && typeof entry === "object")
+          : [];
+        if (issueIds.length > 0 && existingLinkedIssues.length === 0) {
           try {
             const issues = await Promise.all(
               issueIds.slice(0, 5).map((id) => ctx.issues.get(id, event.companyId)),
@@ -455,6 +490,7 @@ const plugin = definePlugin({
             payload.linkedIssues = issues
               .filter(Boolean)
               .map((i) => ({
+                id: i!.id,
                 identifier: i!.identifier,
                 title: i!.title,
                 status: i!.status,
@@ -501,7 +537,8 @@ const plugin = definePlugin({
       });
     }
 
-    ctx.events.on("issue.interaction.created" as never, async (event: PluginEvent) => {
+    const interactionCreatedEvent = "issue.interaction.created";
+    ctx.events.on(interactionCreatedEvent as `plugin.${string}`, async (event: PluginEvent) => {
       const payload = event.payload as Record<string, unknown>;
       const issueId = String(event.entityId ?? "");
       if (!issueId) return;
@@ -509,6 +546,13 @@ const plugin = definePlugin({
       const interactionKind = String(payload.interactionKind ?? "");
       if (!interactionId) return;
       if (interactionKind !== "request_confirmation" && interactionKind !== "ask_user_questions") return;
+      if (interactionKind === "ask_user_questions" && !config.enableInbound) {
+        ctx.logger.warn("Skipping ask_user_questions Telegram notification: enableInbound=false", {
+          issueId,
+          interactionId,
+        });
+        return;
+      }
       if (!boardApiToken) {
         ctx.logger.warn("Skipping interaction Telegram notification: board token missing", {
           issueId,
@@ -955,9 +999,10 @@ async function handleUpdate(
   baseUrl: string,
   publicUrl?: string,
   boardApiToken: string = "",
+  decisionAllowlist: ReadonlySet<string> = new Set(),
 ): Promise<void> {
   if (update.callback_query) {
-    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken);
+    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, decisionAllowlist);
     return;
   }
 
@@ -1096,6 +1141,16 @@ async function handleUpdate(
         );
         return;
       }
+      if (!isDecisionActorAllowed(msg.from ?? { id: Number(chatId) }, decisionAllowlist)) {
+        await sendMessage(
+          ctx,
+          token,
+          chatId,
+          escapeMarkdownV2("You are not allowed to submit decisions in this chat."),
+          { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+        );
+        return;
+      }
 
       try {
         if (mapping.interactionKind === "request_confirmation") {
@@ -1153,11 +1208,19 @@ async function handleUpdate(
         await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
         await ctx.state.set({ scopeKind: "instance", stateKey: inboundKey }, { routedAt: new Date().toISOString() });
       } catch (err) {
+        const reason = String(err).slice(0, 180);
         ctx.logger.error("Failed to route interaction reply", {
           issueId: mapping.issueId,
           interactionId: mapping.interactionId,
           error: String(err),
         });
+        await sendMessage(
+          ctx,
+          token,
+          chatId,
+          escapeMarkdownV2(`Could not submit your decision: ${reason}. Please retry or use the inline buttons.`),
+          { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+        );
       }
     }
   }
@@ -1169,24 +1232,72 @@ async function handleCallbackQuery(
   query: NonNullable<TelegramUpdate["callback_query"]>,
   baseUrl: string,
   boardApiToken: string = "",
+  decisionAllowlist: ReadonlySet<string> = new Set(),
 ): Promise<void> {
   const data = query.data;
   if (!data) return;
 
-  const actor = query.from.username ?? query.from.first_name ?? String(query.from.id);
+  const actorId = query.from.username ?? query.from.first_name ?? String(query.from.id);
+  const actorLabel = describeDecisionActor(query.from);
   const chatId = query.message?.chat.id ? String(query.message.chat.id) : null;
   const messageId = query.message?.message_id;
 
+  const interactionCallback = parseInteractionCallbackData(data);
+  if (interactionCallback) {
+    if (!boardApiToken) {
+      await answerCallbackQuery(ctx, token, query.id, "Board token missing");
+      return;
+    }
+    if (!isDecisionActorAllowed(query.from, decisionAllowlist)) {
+      await answerCallbackQuery(ctx, token, query.id, "Not allowed");
+      return;
+    }
+    if (!chatId || !messageId) {
+      await answerCallbackQuery(ctx, token, query.id, "Missing message context");
+      return;
+    }
+    try {
+      await respondInteraction(ctx.http, {
+        baseUrl,
+        issueId: interactionCallback.issueId,
+        interactionId: interactionCallback.interactionId,
+        action: interactionCallback.action,
+        boardApiToken,
+      });
+      await answerCallbackQuery(
+        ctx,
+        token,
+        query.id,
+        interactionCallback.action === "accept" ? "Accepted" : "Rejected",
+      );
+      await editMessage(
+        ctx,
+        token,
+        chatId,
+        messageId,
+        `${escapeMarkdownV2(interactionCallback.action === "accept" ? "✅ Accepted" : "❌ Rejected")} by ${escapeMarkdownV2(actorLabel)}`,
+        { parseMode: "MarkdownV2" },
+      );
+    } catch (err) {
+      await answerCallbackQuery(ctx, token, query.id, `Failed: ${String(err)}`);
+    }
+    return;
+  }
+
   if (data.startsWith("approve_")) {
+    if (!isDecisionActorAllowed(query.from, decisionAllowlist)) {
+      await answerCallbackQuery(ctx, token, query.id, "Not allowed");
+      return;
+    }
     const approvalId = data.replace("approve_", "");
-    ctx.logger.info("Approval button clicked", { approvalId, actor });
+    ctx.logger.info("Approval button clicked", { approvalId, actor: actorId });
 
     try {
       await submitApprovalDecision(ctx.http, {
         baseUrl,
         approvalId,
         action: "approve",
-        actor,
+        actor: actorId,
         boardApiToken,
       });
 
@@ -1198,7 +1309,7 @@ async function handleCallbackQuery(
           token,
           chatId,
           messageId,
-          `${escapeMarkdownV2("\u2705")} *Approved* by ${escapeMarkdownV2(actor)}`,
+          `${escapeMarkdownV2("\u2705")} *Approved* by ${escapeMarkdownV2(actorLabel)}`,
           { parseMode: "MarkdownV2" },
         );
       }
@@ -1209,6 +1320,10 @@ async function handleCallbackQuery(
   }
 
   if (data === "interaction_accept" || data === "interaction_reject") {
+    if (!isDecisionActorAllowed(query.from, decisionAllowlist)) {
+      await answerCallbackQuery(ctx, token, query.id, "Not allowed");
+      return;
+    }
     const action = data === "interaction_accept" ? "accept" : "reject";
     if (!boardApiToken) {
       await answerCallbackQuery(ctx, token, query.id, "Board token missing");
@@ -1242,7 +1357,7 @@ async function handleCallbackQuery(
         token,
         chatId,
         messageId,
-        `${escapeMarkdownV2(action === "accept" ? "✅ Accepted" : "❌ Rejected")} by ${escapeMarkdownV2(actor)}`,
+        `${escapeMarkdownV2(action === "accept" ? "✅ Accepted" : "❌ Rejected")} by ${escapeMarkdownV2(actorLabel)}`,
         { parseMode: "MarkdownV2" },
       );
     } catch (err) {
@@ -1261,7 +1376,7 @@ async function handleCallbackQuery(
       token,
       action,
       escalationId,
-      actor,
+      actorId,
       query.id,
       chatId,
       messageId,
@@ -1271,15 +1386,19 @@ async function handleCallbackQuery(
   }
 
   if (data.startsWith("reject_")) {
+    if (!isDecisionActorAllowed(query.from, decisionAllowlist)) {
+      await answerCallbackQuery(ctx, token, query.id, "Not allowed");
+      return;
+    }
     const approvalId = data.replace("reject_", "");
-    ctx.logger.info("Rejection button clicked", { approvalId, actor });
+    ctx.logger.info("Rejection button clicked", { approvalId, actor: actorId });
 
     try {
       await submitApprovalDecision(ctx.http, {
         baseUrl,
         approvalId,
         action: "reject",
-        actor,
+        actor: actorId,
         boardApiToken,
       });
 
@@ -1291,7 +1410,7 @@ async function handleCallbackQuery(
           token,
           chatId,
           messageId,
-          `${escapeMarkdownV2("\u274c")} *Rejected* by ${escapeMarkdownV2(actor)}`,
+          `${escapeMarkdownV2("\u274c")} *Rejected* by ${escapeMarkdownV2(actorLabel)}`,
           { parseMode: "MarkdownV2" },
         );
       }
@@ -1303,14 +1422,14 @@ async function handleCallbackQuery(
 
   if (data.startsWith("handoff_approve_")) {
     const handoffId = data.replace("handoff_approve_", "");
-    await handleHandoffApproval(ctx, token, handoffId, actor, query.id, chatId, messageId);
+    await handleHandoffApproval(ctx, token, handoffId, actorId, query.id, chatId, messageId);
     await answerCallbackQuery(ctx, token, query.id, "Handoff approved");
     return;
   }
 
   if (data.startsWith("handoff_reject_")) {
     const handoffId = data.replace("handoff_reject_", "");
-    await handleHandoffRejection(ctx, token, handoffId, actor, query.id, chatId, messageId);
+    await handleHandoffRejection(ctx, token, handoffId, actorId, query.id, chatId, messageId);
     await answerCallbackQuery(ctx, token, query.id, "Handoff rejected");
     return;
   }

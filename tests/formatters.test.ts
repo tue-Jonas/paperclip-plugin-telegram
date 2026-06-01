@@ -218,6 +218,28 @@ describe("formatInteractionCreated", () => {
     }));
     expect(msg.text).toContain("scope");
     expect(msg.text).toContain("Reply format");
+    expect(msg.text).toContain("scope\\=all");
+    expect(msg.text).toContain("region\\=eu,us");
+  });
+
+  it("encodes interaction callback data with issue and interaction identifiers when UUIDs are available", () => {
+    const msg = formatInteractionCreated({
+      eventType: "issue.interaction.created",
+      entityId: "11111111-1111-4111-8111-111111111111",
+      entityType: "issue",
+      companyId: "company-1",
+      occurredAt: new Date().toISOString(),
+      payload: {
+        interactionId: "22222222-2222-4222-8222-222222222222",
+        interactionKind: "request_confirmation",
+        issueIdentifier: "TWX-54",
+        interaction: { payload: { prompt: "Ship it?" } },
+      },
+    } as PluginEvent);
+
+    const buttons = msg.options.inlineKeyboard![0];
+    expect(buttons[0].callback_data).toMatch(/^ia:a:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$/);
+    expect(buttons[1].callback_data).toMatch(/^ia:r:[A-Za-z0-9_-]+:[A-Za-z0-9_-]+$/);
   });
 });
 

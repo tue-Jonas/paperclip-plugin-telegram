@@ -36,6 +36,10 @@ This is that plugin.
 - Clicking a button calls the Paperclip API and updates the Telegram message inline
 - Callback query acknowledgment with result text
 
+### Decision safety
+- Keep decision chats private/restricted to trusted operators
+- Optional `allowedDecisionUsernames` allowlist limits approval/interaction decisions to specific Telegram usernames
+
 ### Per-type chat routing
 - `approvalsChatId` - Dedicated chat for approval notifications
 - `errorsChatId` - Dedicated chat for agent errors
@@ -160,6 +164,7 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
 | `paperclipPublicUrl` | No | Public URL for issue links in messages |
 | `boardApiToken` | No | Inline `pcp_board_...` token used for approval callbacks (advanced) |
 | `boardApiTokenRef` | No | Secret reference for board API token (preferred over inline token) |
+| `allowedDecisionUsernames` | No | Optional Telegram username allowlist for approval/interaction decisions (`["jonas","thomas"]`) |
 | `enableCommands` | No | Enable bot commands (default: true) |
 | `enableInbound` | No | Route Telegram replies to issues (default: true) |
 | `topicRouting` | No | Map forum topics to projects (default: false) |
@@ -176,6 +181,10 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
 | `transcriptionApiKeyRef` | No | Secret reference to OpenAI API key for Whisper |
 | `maxSuggestionsPerHourPerCompany` | No | Rate limit for proactive suggestions (default: 10) |
 | `watchDeduplicationWindowMs` | No | Suppress duplicate watch suggestions within this window (default: 86400000 / 24h) |
+
+## Deploy order for interaction events
+
+`issue.interaction.*` notifications depend on newer Paperclip core event mappings. Deploy core first, then deploy/reload this plugin build, so interaction events are emitted before the plugin subscribes.
 
 ## Agent tools
 
