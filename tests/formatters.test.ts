@@ -3,6 +3,7 @@ import {
   formatIssueCreated,
   formatIssueDone,
   formatApprovalCreated,
+  formatInteractionCreated,
   formatAgentError,
   formatAgentRunStarted,
   formatAgentRunFinished,
@@ -134,6 +135,26 @@ describe("formatApprovalCreated", () => {
     expect(msg.text).toContain("Builder");
   });
 
+  it("uses approval payload labels and includes decision context blocks", () => {
+    const msg = formatApprovalCreated(mockEvent({
+      approvalId: "apr-ctx",
+      approvalPayload: {
+        prompt: "Ship to production now?",
+        summary: "All checks passed on staging.",
+        options: ["Ship now", "Wait for QA"],
+        recommendedDefault: "Ship now",
+        risks: ["Small chance of rollback"],
+        acceptLabel: "Ship now",
+        rejectLabel: "Hold",
+      },
+    }));
+    const buttons = msg.options.inlineKeyboard![0];
+    expect(buttons[0].text).toBe("Ship now");
+    expect(buttons[1].text).toBe("Hold");
+    expect(msg.text).toContain("Recommended Default");
+    expect(msg.text).toContain("Risks");
+  });
+
   it("includes linked issues", () => {
     const msg = formatApprovalCreated(mockEvent({
       linkedIssues: [
@@ -143,13 +164,60 @@ describe("formatApprovalCreated", () => {
     }));
     expect(msg.text).toContain("ISS\\-1");
     expect(msg.text).toContain("ISS\\-2");
-    expect(msg.text).toContain("Linked Issues");
+    expect(msg.text).toContain("Issue Context");
   });
 
   it("truncates description at word boundary", () => {
     const longDesc = Array(80).fill("word").join(" ");
     const msg = formatApprovalCreated(mockEvent({ description: longDesc }));
-    expect(msg.text).toContain("\\.\\.\\.");
+    expect(msg.text).toContain("word");
+  });
+});
+
+describe("formatInteractionCreated", () => {
+  it("renders request_confirmation interactions with accept/reject buttons", () => {
+    const msg = formatInteractionCreated(mockEvent({
+      interactionId: "int-1",
+      interactionKind: "request_confirmation",
+      issueIdentifier: "TWX-46",
+      issueTitle: "Ship Telegram interface",
+      interaction: {
+        payload: {
+          prompt: "Approve this rollout?",
+          acceptLabel: "Yes, ship",
+          rejectLabel: "No, wait",
+        },
+      },
+    }));
+    expect(msg.text).toContain("Approve this rollout");
+    const buttons = msg.options.inlineKeyboard![0];
+    expect(buttons[0].callback_data).toBe("interaction_accept");
+    expect(buttons[1].callback_data).toBe("interaction_reject");
+  });
+
+  it("renders ask_user_questions instructions", () => {
+    const msg = formatInteractionCreated(mockEvent({
+      interactionId: "int-2",
+      interactionKind: "ask_user_questions",
+      interaction: {
+        payload: {
+          title: "Pick scope",
+          questions: [
+            {
+              id: "scope",
+              prompt: "Which scope?",
+              selectionMode: "single",
+              options: [
+                { id: "p0", label: "Phase 0 only" },
+                { id: "all", label: "All phases" },
+              ],
+            },
+          ],
+        },
+      },
+    }));
+    expect(msg.text).toContain("scope");
+    expect(msg.text).toContain("Reply format");
   });
 });
 

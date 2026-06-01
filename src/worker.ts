@@ -20,6 +20,7 @@ import {
   formatIssueCreated,
   formatIssueDone,
   formatApprovalCreated,
+  formatInteractionCreated,
   formatAgentError,
   formatAgentRunStarted,
   formatAgentRunFinished,
@@ -50,11 +51,12 @@ import {
   createIssue,
   updateIssue,
 } from "./host-api.js";
+import { fetchApprovalContext, submitApprovalDecision } from "./approvals-api.js";
+import { fetchInteraction, respondInteraction } from "./interactions-api.js";
 
 type TelegramConfig = {
   telegramBotTokenRef: string;
   telegramBotToken?: string;
-  // Inbound board-API token (see host-api.ts). HostApiConfig fields.
   boardApiToken?: string;
   boardApiTokenRef?: string;
   defaultCompanyId?: string;
@@ -130,6 +132,85 @@ type TelegramUpdate = {
 
 const TELEGRAM_API = "https://api.telegram.org";
 
+type StoredMessageMapping = {
+  entityId: string;
+  entityType: string;
+  companyId: string;
+  eventType?: string;
+  issueId?: string;
+  approvalId?: string;
+  interactionId?: string;
+  interactionKind?: string;
+  interactionQuestions?: Array<{
+    id: string;
+    selectionMode: "single" | "multi";
+    options: Array<{ id: string; label: string }>;
+  }>;
+};
+
+function toRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" ? value as Record<string, unknown> : {};
+}
+
+function firstNonEmptyString(source: Record<string, unknown>, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = source[key];
+    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+  }
+  return null;
+}
+
+function formatInboundAuditPrefix(msg: NonNullable<TelegramUpdate["message"]>): string {
+  const username = msg.from?.username ? `@${msg.from.username}` : null;
+  const display = username ?? msg.from?.first_name ?? (msg.from?.id ? String(msg.from.id) : "unknown");
+  const chat = String(msg.chat.id);
+  const thread = msg.message_thread_id ? String(msg.message_thread_id) : "main";
+  return `[Telegram reply by ${display} | chat:${chat} | thread:${thread} | message:${String(msg.message_id)}]`;
+}
+
+function buildInboundAuditComment(
+  msg: NonNullable<TelegramUpdate["message"]>,
+  body: string,
+): string {
+  return `${formatInboundAuditPrefix(msg)}\n\n${body}`;
+}
+
+function parseAskQuestionsAnswers(
+  text: string,
+  questions: StoredMessageMapping["interactionQuestions"],
+): Array<{ questionId: string; optionIds: string[] }> {
+  const availableQuestions = Array.isArray(questions) ? questions : [];
+  const answers: Array<{ questionId: string; optionIds: string[] }> = [];
+  const byQuestionId = new Map<string, { id: string; selectionMode: "single" | "multi"; options: Set<string> }>();
+  for (const question of availableQuestions) {
+    byQuestionId.set(question.id, {
+      id: question.id,
+      selectionMode: question.selectionMode,
+      options: new Set(question.options.map((option) => option.id)),
+    });
+  }
+
+  const lines = text.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
+  for (const line of lines) {
+    const parts = line.split("=");
+    if (parts.length !== 2) continue;
+    const questionId = parts[0]?.trim() ?? "";
+    const optionPart = parts[1]?.trim() ?? "";
+    if (!questionId || !optionPart) continue;
+    const question = byQuestionId.get(questionId);
+    if (!question) continue;
+    const optionIds = optionPart
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0 && question.options.has(entry));
+    if (optionIds.length === 0) continue;
+    const normalized = question.selectionMode === "single" ? [optionIds[0]!] : Array.from(new Set(optionIds));
+    answers.push({ questionId, optionIds: normalized });
+  }
+
+  return answers;
+}
+
 async function resolveChat(
   ctx: PluginContext,
   companyId: string,
@@ -181,6 +262,14 @@ const plugin = definePlugin({
       return;
     }
 
+    let boardApiToken = config.boardApiToken?.trim() ?? "";
+    if (!boardApiToken && config.boardApiTokenRef) {
+      try {
+        boardApiToken = await ctx.secrets.resolve(config.boardApiTokenRef);
+      } catch {
+        boardApiToken = "";
+      }
+    }
     // --- Register bot commands with Telegram ---
     if (config.enableCommands) {
       const allCommands = [
@@ -223,7 +312,15 @@ const plugin = definePlugin({
           if (data.ok && data.result) {
             for (const update of data.result) {
               lastUpdateId = Math.max(lastUpdateId, update.update_id);
-              await handleUpdate(ctx, token, config, update, baseUrl, publicUrl);
+              await handleUpdate(
+                ctx,
+                token,
+                config,
+                update,
+                baseUrl,
+                publicUrl,
+                boardApiToken,
+              );
             }
           }
         } catch (err) {
@@ -271,6 +368,7 @@ const plugin = definePlugin({
       event: PluginEvent,
       formatter: (e: PluginEvent, opts?: IssueLinksOpts) => { text: string; options: import("./telegram-api.js").SendMessageOptions },
       overrideChatId?: string,
+      mappingOverride?: Partial<StoredMessageMapping>,
     ) => {
       const chatId = await resolveChat(
         ctx,
@@ -299,6 +397,13 @@ const plugin = definePlugin({
       const messageId = await sendMessage(ctx, token, chatId, msg.text, msg.options);
 
       if (messageId) {
+        const mapping: StoredMessageMapping = {
+          entityId: String(event.entityId ?? ""),
+          entityType: String(event.entityType ?? "unknown"),
+          companyId: event.companyId,
+          eventType: event.eventType,
+          ...(mappingOverride ?? {}),
+        };
         // Reply-routing map + activity log are best-effort: gated writes can be
         // rejected on hosts without an invocation scope in event handlers. The
         // notification itself has already been delivered, so never let these
@@ -309,12 +414,7 @@ const plugin = definePlugin({
               scopeKind: "instance",
               stateKey: `msg_${chatId}_${messageId}`,
             },
-            {
-              entityId: event.entityId,
-              entityType: event.entityType,
-              companyId: event.companyId,
-              eventType: event.eventType,
-            },
+            mapping,
           );
         } catch { /* best effort */ }
 
@@ -365,6 +465,35 @@ const plugin = definePlugin({
     if (config.notifyOnApprovalCreated) {
       ctx.events.on("approval.created", async (event: PluginEvent) => {
         const payload = event.payload as Record<string, unknown>;
+        const approvalId = String(payload.approvalId ?? event.entityId);
+
+        if (boardApiToken) {
+          try {
+            const approvalContext = await fetchApprovalContext(ctx.http, {
+              baseUrl,
+              approvalId,
+              boardApiToken,
+            });
+            payload.approvalPayload = toRecord(approvalContext.approval.payload);
+            payload.type = String(approvalContext.approval.type ?? payload.type ?? "unknown");
+            const requestedByAgentId = firstNonEmptyString(approvalContext.approval, ["requestedByAgentId"]);
+            if (requestedByAgentId && !payload.agentId) payload.agentId = requestedByAgentId;
+            payload.linkedIssues = approvalContext.issues.map((issue) => ({
+              id: String(issue.id ?? ""),
+              identifier: String(issue.identifier ?? ""),
+              title: String(issue.title ?? ""),
+              status: String(issue.status ?? ""),
+              priority: String(issue.priority ?? ""),
+              assignee: firstNonEmptyString(toRecord(issue), ["assigneeName"]),
+            }));
+          } catch (err) {
+            ctx.logger.warn("Could not enrich approval notification from API", {
+              approvalId,
+              error: String(err),
+            });
+          }
+        }
+
         // Enrich with linked issue details (event only has issueIds)
         const issueIds = Array.isArray(payload.issueIds) ? payload.issueIds as string[] : [];
         if (issueIds.length > 0 && !payload.linkedIssues) {
@@ -403,9 +532,102 @@ const plugin = definePlugin({
             ? `${approvalType} — ${agentLabel}`
             : approvalType;
         }
-        await notify(event, formatApprovalCreated, config.approvalsChatId);
+        const linkedIssues = Array.isArray(payload.linkedIssues)
+          ? payload.linkedIssues as Array<Record<string, unknown>>
+          : [];
+        const firstIssue = linkedIssues[0];
+        const firstIssueId = firstIssue && typeof firstIssue.id === "string" ? firstIssue.id : null;
+        await notify(
+          event,
+          formatApprovalCreated,
+          config.approvalsChatId,
+          {
+            entityType: "approval",
+            approvalId,
+            issueId: firstIssueId ?? undefined,
+          },
+        );
       });
     }
+
+    ctx.events.on("issue.interaction.created" as never, async (event: PluginEvent) => {
+      const payload = event.payload as Record<string, unknown>;
+      const issueId = String(event.entityId ?? "");
+      if (!issueId) return;
+      const interactionId = String(payload.interactionId ?? "");
+      const interactionKind = String(payload.interactionKind ?? "");
+      if (!interactionId) return;
+      if (interactionKind !== "request_confirmation" && interactionKind !== "ask_user_questions") return;
+      if (!boardApiToken) {
+        ctx.logger.warn("Skipping interaction Telegram notification: board token missing", {
+          issueId,
+          interactionId,
+          interactionKind,
+        });
+        return;
+      }
+
+      try {
+        const [issue, interaction] = await Promise.all([
+          ctx.issues.get(issueId, event.companyId),
+          fetchInteraction(ctx.http, {
+            baseUrl,
+            issueId,
+            interactionId,
+            boardApiToken,
+          }),
+        ]);
+        if (!interaction) return;
+        payload.interaction = interaction;
+        payload.issueIdentifier = issue?.identifier ?? issueId;
+        payload.issueTitle = issue?.title ?? null;
+        payload.interactionKind = interactionKind;
+
+        const interactionPayload = toRecord(interaction.payload);
+        const questions = Array.isArray(interactionPayload.questions)
+          ? interactionPayload.questions
+              .map((question) => {
+                const q = toRecord(question);
+                const id = firstNonEmptyString(q, ["id"]);
+                if (!id) return null;
+                const selectionMode = q.selectionMode === "multi" ? "multi" : "single";
+                const options = Array.isArray(q.options)
+                  ? q.options
+                      .map((option) => {
+                        const o = toRecord(option);
+                        const optionId = firstNonEmptyString(o, ["id"]);
+                        const label = firstNonEmptyString(o, ["label"]);
+                        if (!optionId || !label) return null;
+                        return { id: optionId, label };
+                      })
+                      .filter((option): option is { id: string; label: string } => Boolean(option))
+                  : [];
+                return { id, selectionMode, options };
+              })
+              .filter((entry): entry is { id: string; selectionMode: "single" | "multi"; options: Array<{ id: string; label: string }> } => Boolean(entry))
+          : [];
+
+        await notify(
+          event,
+          formatInteractionCreated,
+          config.approvalsChatId || config.defaultChatId,
+          {
+            entityType: "interaction",
+            issueId,
+            interactionId,
+            interactionKind,
+            interactionQuestions: questions,
+          },
+        );
+      } catch (err) {
+        ctx.logger.error("Failed to dispatch interaction notification", {
+          issueId,
+          interactionId,
+          interactionKind,
+          error: String(err),
+        });
+      }
+    });
 
     if (config.notifyOnAgentError) {
       ctx.events.on("agent.run.failed", (event: PluginEvent) =>
@@ -849,9 +1071,10 @@ async function handleUpdate(
   update: TelegramUpdate,
   baseUrl: string,
   publicUrl?: string,
+  boardApiToken: string = "",
 ): Promise<void> {
   if (update.callback_query) {
-    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl);
+    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken);
     return;
   }
 
@@ -928,17 +1151,23 @@ async function handleUpdate(
 
   if (config.enableInbound && msg.reply_to_message?.from?.is_bot) {
     const replyToId = msg.reply_to_message.message_id;
+    const inboundKey = `inbound_${chatId}_${msg.message_id}`;
+    const alreadyProcessed = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: inboundKey,
+    });
+    if (alreadyProcessed) return;
+
     // The msg→entity map is written by notify() via ctx.state.set, which is
     // gated in event handlers under the invocation-scope bug — so this lookup
     // may throw or be empty. Degrade to "no mapping" instead of crashing the
-    // poll loop. (Restoring reply-to-comment fully needs the host scope fix or
-    // an in-memory msg map on the outbound side — tracked as a follow-up.)
-    let mapping: { entityId: string; entityType: string; companyId: string } | null = null;
+    // poll loop.
+    let mapping: StoredMessageMapping | null = null;
     try {
       mapping = await ctx.state.get({
         scopeKind: "instance",
         stateKey: `msg_${chatId}_${replyToId}`,
-      }) as { entityId: string; entityType: string; companyId: string } | null;
+      }) as StoredMessageMapping | null;
     } catch {
       mapping = null;
     }
@@ -957,20 +1186,118 @@ async function handleUpdate(
         escalationId: mapping.entityId,
         from: msg.from?.username,
       });
+      await ctx.state.set({ scopeKind: "instance", stateKey: inboundKey }, { routedAt: new Date().toISOString() });
     } else if (mapping && mapping.entityType === "issue") {
       try {
-        // Use the SDK (not ctx.http.fetch) because the plugin sandbox blocks
-        // outbound fetches to private IPs like 127.0.0.1 for SSRF protection.
-        // The SDK's createComment goes through the plugin RPC bridge instead.
-        await ctx.issues.createComment(mapping.entityId, text, mapping.companyId);
+        await ctx.issues.createComment(
+          mapping.entityId,
+          buildInboundAuditComment(msg, text),
+          mapping.companyId,
+        );
         await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
         ctx.logger.info("Routed Telegram reply to issue comment", {
           issueId: mapping.entityId,
           from: msg.from?.username,
         });
+        await ctx.state.set({ scopeKind: "instance", stateKey: inboundKey }, { routedAt: new Date().toISOString() });
       } catch (err) {
         ctx.logger.error("Failed to route inbound message", {
           issueId: mapping.entityId,
+          error: String(err),
+        });
+      }
+    } else if (mapping && mapping.entityType === "approval" && mapping.issueId) {
+      try {
+        await ctx.issues.createComment(
+          mapping.issueId,
+          buildInboundAuditComment(msg, text),
+          mapping.companyId,
+        );
+        await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+        ctx.logger.info("Routed Telegram reply to approval-linked issue comment", {
+          approvalId: mapping.approvalId ?? mapping.entityId,
+          issueId: mapping.issueId,
+          from: msg.from?.username,
+        });
+        await ctx.state.set({ scopeKind: "instance", stateKey: inboundKey }, { routedAt: new Date().toISOString() });
+      } catch (err) {
+        ctx.logger.error("Failed to route approval reply to issue comment", {
+          approvalId: mapping.approvalId ?? mapping.entityId,
+          issueId: mapping.issueId,
+          error: String(err),
+        });
+      }
+    } else if (mapping && mapping.entityType === "interaction" && mapping.issueId && mapping.interactionId) {
+      if (!boardApiToken) {
+        await sendMessage(
+          ctx,
+          token,
+          chatId,
+          escapeMarkdownV2("Cannot route interaction reply: board token is missing."),
+          { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+        );
+        return;
+      }
+
+      try {
+        if (mapping.interactionKind === "request_confirmation") {
+          const normalized = text.trim().toLowerCase();
+          if (["accept", "approve", "yes", "y"].includes(normalized)) {
+            await respondInteraction(ctx.http, {
+              baseUrl,
+              issueId: mapping.issueId,
+              interactionId: mapping.interactionId,
+              action: "accept",
+              boardApiToken,
+            });
+          } else if (["reject", "no", "n"].includes(normalized)) {
+            await respondInteraction(ctx.http, {
+              baseUrl,
+              issueId: mapping.issueId,
+              interactionId: mapping.interactionId,
+              action: "reject",
+              boardApiToken,
+              reason: `Telegram reply: ${text}`,
+            });
+          } else {
+            await sendMessage(
+              ctx,
+              token,
+              chatId,
+              escapeMarkdownV2("Reply with 'accept' or 'reject' for this confirmation."),
+              { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+            );
+            return;
+          }
+        } else if (mapping.interactionKind === "ask_user_questions") {
+          const answers = parseAskQuestionsAnswers(text, mapping.interactionQuestions);
+          if (answers.length === 0) {
+            await sendMessage(
+              ctx,
+              token,
+              chatId,
+              escapeMarkdownV2("No valid answers parsed. Use: question_id=option_id[,option_id]"),
+              { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+            );
+            return;
+          }
+          await respondInteraction(ctx.http, {
+            baseUrl,
+            issueId: mapping.issueId,
+            interactionId: mapping.interactionId,
+            action: "respond",
+            boardApiToken,
+            answers,
+          });
+        } else {
+          return;
+        }
+        await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+        await ctx.state.set({ scopeKind: "instance", stateKey: inboundKey }, { routedAt: new Date().toISOString() });
+      } catch (err) {
+        ctx.logger.error("Failed to route interaction reply", {
+          issueId: mapping.issueId,
+          interactionId: mapping.interactionId,
           error: String(err),
         });
       }
@@ -1041,6 +1368,7 @@ async function handleCallbackQuery(
   token: string,
   query: NonNullable<TelegramUpdate["callback_query"]>,
   baseUrl: string,
+  boardApiToken: string = "",
 ): Promise<void> {
   const data = query.data;
   if (!data) return;
@@ -1054,14 +1382,13 @@ async function handleCallbackQuery(
     ctx.logger.info("Approval button clicked", { approvalId, actor });
 
     try {
-      await ctx.http.fetch(
-        `${baseUrl}/api/approvals/${approvalId}/approve`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ decidedByUserId: `telegram:${actor}` }),
-        },
-      );
+      await submitApprovalDecision(ctx.http, {
+        baseUrl,
+        approvalId,
+        action: "approve",
+        actor,
+        boardApiToken,
+      });
 
       await answerCallbackQuery(ctx, token, query.id, "Approved");
 
@@ -1075,6 +1402,49 @@ async function handleCallbackQuery(
           { parseMode: "MarkdownV2" },
         );
       }
+    } catch (err) {
+      await answerCallbackQuery(ctx, token, query.id, `Failed: ${String(err)}`);
+    }
+    return;
+  }
+
+  if (data === "interaction_accept" || data === "interaction_reject") {
+    const action = data === "interaction_accept" ? "accept" : "reject";
+    if (!boardApiToken) {
+      await answerCallbackQuery(ctx, token, query.id, "Board token missing");
+      return;
+    }
+    if (!chatId || !messageId) {
+      await answerCallbackQuery(ctx, token, query.id, "Missing message context");
+      return;
+    }
+
+    const mapping = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `msg_${chatId}_${messageId}`,
+    }) as StoredMessageMapping | null;
+    if (!mapping?.issueId || !mapping.interactionId) {
+      await answerCallbackQuery(ctx, token, query.id, "Interaction mapping missing");
+      return;
+    }
+
+    try {
+      await respondInteraction(ctx.http, {
+        baseUrl,
+        issueId: mapping.issueId,
+        interactionId: mapping.interactionId,
+        action,
+        boardApiToken,
+      });
+      await answerCallbackQuery(ctx, token, query.id, action === "accept" ? "Accepted" : "Rejected");
+      await editMessage(
+        ctx,
+        token,
+        chatId,
+        messageId,
+        `${escapeMarkdownV2(action === "accept" ? "✅ Accepted" : "❌ Rejected")} by ${escapeMarkdownV2(actor)}`,
+        { parseMode: "MarkdownV2" },
+      );
     } catch (err) {
       await answerCallbackQuery(ctx, token, query.id, `Failed: ${String(err)}`);
     }
@@ -1105,14 +1475,13 @@ async function handleCallbackQuery(
     ctx.logger.info("Rejection button clicked", { approvalId, actor });
 
     try {
-      await ctx.http.fetch(
-        `${baseUrl}/api/approvals/${approvalId}/reject`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ decidedByUserId: `telegram:${actor}` }),
-        },
-      );
+      await submitApprovalDecision(ctx.http, {
+        baseUrl,
+        approvalId,
+        action: "reject",
+        actor,
+        boardApiToken,
+      });
 
       await answerCallbackQuery(ctx, token, query.id, "Rejected");
 
