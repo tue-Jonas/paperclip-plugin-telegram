@@ -1,7 +1,20 @@
 import type { PaperclipPluginManifestV1 } from "@paperclipai/plugin-sdk";
 import { DEFAULT_CONFIG, PLUGIN_ID, PLUGIN_VERSION, MAX_AGENTS_PER_THREAD } from "./constants.js";
 
-const manifest: PaperclipPluginManifestV1 = {
+const databaseCapabilities = [
+  "database.namespace.migrate",
+  "database.namespace.read",
+  "database.namespace.write",
+] as unknown as PaperclipPluginManifestV1["capabilities"];
+
+type ManifestWithDatabase = PaperclipPluginManifestV1 & {
+  database: {
+    namespaceSlug: string;
+    migrationsDir: string;
+  };
+};
+
+const manifest: ManifestWithDatabase = {
   id: PLUGIN_ID,
   apiVersion: 1,
   version: PLUGIN_VERSION,
@@ -26,6 +39,7 @@ const manifest: PaperclipPluginManifestV1 = {
     "agent.tools.register",
     "events.subscribe",
     "events.emit",
+    ...databaseCapabilities,
     "plugin.state.read",
     "plugin.state.write",
     "http.outbound",
@@ -36,6 +50,10 @@ const manifest: PaperclipPluginManifestV1 = {
   ],
   entrypoints: {
     worker: "./dist/worker.js",
+  },
+  database: {
+    namespaceSlug: "telegram",
+    migrationsDir: "migrations",
   },
   instanceConfigSchema: {
     type: "object",

@@ -148,10 +148,11 @@ type StoredMessageMapping = {
   }>;
 };
 
-type InteractionDeliveryRecord = {
-  interactionId: string;
-  issueId: string;
-  sentAt: string;
+type DatabasePluginContext = PluginContext & {
+  db: {
+    namespace: string;
+    execute(sql: string, params?: unknown[]): Promise<{ rowCount: number }>;
+  };
 };
 
 function toRecord(value: unknown): Record<string, unknown> {
@@ -244,6 +245,53 @@ async function resolveChat(
 // then the chatId. See host-api.ts.
 function resolveCompanyId(config: HostApiConfig, chatId: string): string {
   return resolveCompanyIdFromMap(chatId, config);
+}
+
+function quoteIdentifier(value: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+    throw new Error(`Unsafe SQL identifier: ${value}`);
+  }
+  return `"${value.replaceAll("\"", "\"\"")}"`;
+}
+
+function pluginTableName(namespace: string, table: string): string {
+  return `${quoteIdentifier(namespace)}.${quoteIdentifier(table)}`;
+}
+
+async function claimInteractionDelivery(
+  ctx: PluginContext,
+  companyId: string,
+  issueId: string,
+  interactionId: string,
+  interactionKind: string,
+): Promise<boolean> {
+  const db = (ctx as DatabasePluginContext).db;
+  const deliveryKey = `${companyId}:${issueId}:${interactionId}`;
+  const result = await db.execute(
+    `INSERT INTO ${pluginTableName(db.namespace, "interaction_deliveries")}
+       (delivery_key, company_id, issue_id, interaction_id, interaction_kind)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (delivery_key) DO NOTHING`,
+    [deliveryKey, companyId, issueId, interactionId, interactionKind],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+async function recordInteractionDeliverySent(
+  ctx: PluginContext,
+  companyId: string,
+  issueId: string,
+  interactionId: string,
+  telegramMessageId: number,
+): Promise<void> {
+  const db = (ctx as DatabasePluginContext).db;
+  const deliveryKey = `${companyId}:${issueId}:${interactionId}`;
+  await db.execute(
+    `UPDATE ${pluginTableName(db.namespace, "interaction_deliveries")}
+     SET telegram_message_id = $2, sent_at = now()
+     WHERE delivery_key = $1`,
+    [deliveryKey, String(telegramMessageId)],
+  );
 }
 
 const plugin = definePlugin({
@@ -575,19 +623,10 @@ const plugin = definePlugin({
         return;
       }
 
-      const interactionDeliveryStateKey = `interaction_notification_${event.companyId}_${issueId}_${interactionId}`;
       try {
-        const existingDelivery = await ctx.state.get({
-          scopeKind: "instance",
-          stateKey: interactionDeliveryStateKey,
-        }) as InteractionDeliveryRecord | null;
-        if (existingDelivery?.interactionId === interactionId) return;
-      } catch {
-        // If state cannot be read in this host invocation path, continue
-        // without dedupe; notification still has best-effort fallback behavior.
-      }
+        const claimed = await claimInteractionDelivery(ctx, event.companyId, issueId, interactionId, interactionKind);
+        if (!claimed) return;
 
-      try {
         const [issue, interaction] = await Promise.all([
           ctx.issues.get(issueId, event.companyId),
           fetchInteraction(ctx.http, {
@@ -642,21 +681,9 @@ const plugin = definePlugin({
 
         if (messageId) {
           try {
-            const record: InteractionDeliveryRecord = {
-              interactionId,
-              issueId,
-              sentAt: new Date().toISOString(),
-            };
-            await ctx.state.set(
-              {
-                scopeKind: "instance",
-                stateKey: interactionDeliveryStateKey,
-              },
-              record,
-            );
+            await recordInteractionDeliverySent(ctx, event.companyId, issueId, interactionId, messageId);
           } catch {
-            // Best-effort dedupe persistence; messages are already sent so
-            // this is okay to skip.
+            // Best-effort status update; the pre-send claim already prevents duplicates.
           }
         }
       } catch (err) {
