@@ -881,8 +881,9 @@ const plugin = definePlugin({
       ? "daily"
       : config.digestMode ?? "off";
 
-    if (effectiveDigestMode !== "off") {
-      ctx.jobs.register("telegram-daily-digest", async () => {
+    ctx.jobs.register("telegram-daily-digest", async () => {
+      if (effectiveDigestMode === "off") return;
+
         // Check if current UTC hour matches a configured digest time
         const nowHour = new Date().getUTCHours();
         const nowMin = new Date().getUTCMinutes();
@@ -995,8 +996,7 @@ const plugin = definePlugin({
             });
           }
         }
-      });
-    }
+    });
 
     // --- Phase 1: Escalation support ---
     const escalationManager = new EscalationManager();
@@ -1678,5 +1678,7 @@ async function handleCallbackQuery(
 
   await answerCallbackQuery(ctx, token, query.id, "Unknown action");
 }
+
+export default plugin;
 
 runWorker(plugin, import.meta.url);
