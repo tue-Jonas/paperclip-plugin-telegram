@@ -41,7 +41,7 @@ const fs=require('fs');
 const p='$TARGET/package.json';
 const j=JSON.parse(fs.readFileSync(p,'utf8'));
 j.name='$NEW_NAME';
-j.version=(j.version||'0.0.0')+'-twb';
+j.version=(j.version||'0.0.0').endsWith('-twb') ? j.version : (j.version||'0.0.0')+'-twb';
 j.description='(twb-digital fork) '+(j.description||'');
 fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n');
 console.log('package.json → name='+j.name+' version='+j.version);
@@ -54,7 +54,10 @@ const p='$TARGET/dist/constants.js';
 let s=fs.readFileSync(p,'utf8');
 const before=s;
 s=s.replace(/export const PLUGIN_ID\s*=\s*\"paperclip-plugin-telegram\";/, 'export const PLUGIN_ID = \"$NEW_NAME\";');
-if (s===before) { console.error('ERROR: could not rewrite PLUGIN_ID'); process.exit(1); }
+if (s===before && !s.includes('export const PLUGIN_ID = \"$NEW_NAME\";')) {
+  console.error('ERROR: could not rewrite PLUGIN_ID');
+  process.exit(1);
+}
 fs.writeFileSync(p,s);
 console.log('constants.js → PLUGIN_ID=$NEW_NAME');
 "
