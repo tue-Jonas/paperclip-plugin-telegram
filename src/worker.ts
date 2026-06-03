@@ -96,6 +96,8 @@ type TelegramConfig = {
   watchDeduplicationWindowMs: number;
 };
 
+const INTERACTION_DELIVERIES_NAMESPACE = "plugin_telegram_63f79ea5a3";
+
 type TelegramUpdate = {
   update_id: number;
   message?: {
@@ -251,6 +253,14 @@ function pluginTableName(namespace: string, table: string): string {
   return `${quoteIdentifier(namespace)}.${quoteIdentifier(table)}`;
 }
 
+export function assertInteractionDeliveriesNamespace(ctx: PluginContext): void {
+  if (ctx.db.namespace !== INTERACTION_DELIVERIES_NAMESPACE) {
+    throw new Error(
+      `Telegram interaction delivery migration namespace mismatch: runtime namespace "${ctx.db.namespace}" does not match migration schema "${INTERACTION_DELIVERIES_NAMESPACE}"`,
+    );
+  }
+}
+
 async function claimInteractionDelivery(
   ctx: PluginContext,
   companyId: string,
@@ -270,6 +280,21 @@ async function claimInteractionDelivery(
   return (result.rowCount ?? 0) > 0;
 }
 
+async function releaseInteractionDeliveryClaim(
+  ctx: PluginContext,
+  companyId: string,
+  issueId: string,
+  interactionId: string,
+): Promise<void> {
+  const db = ctx.db;
+  const deliveryKey = `${companyId}:${issueId}:${interactionId}`;
+  await db.execute(
+    `DELETE FROM ${pluginTableName(db.namespace, "interaction_deliveries")}
+     WHERE delivery_key = $1 AND sent_at IS NULL`,
+    [deliveryKey],
+  );
+}
+
 async function recordInteractionDeliverySent(
   ctx: PluginContext,
   companyId: string,
@@ -287,8 +312,146 @@ async function recordInteractionDeliverySent(
   );
 }
 
+type InteractionNotify = (
+  event: PluginEvent,
+  formatter: (e: PluginEvent, opts?: IssueLinksOpts) => { text: string; options: import("./telegram-api.js").SendMessageOptions },
+  overrideChatId?: string,
+  mappingOverride?: Partial<StoredMessageMapping>,
+) => Promise<number | null>;
+
+export async function dispatchInteractionNotification(
+  ctx: PluginContext,
+  event: PluginEvent,
+  input: {
+    baseUrl: string;
+    boardApiToken: string;
+    defaultChatId: string;
+    approvalsChatId?: string;
+    notify: InteractionNotify;
+  },
+): Promise<"sent" | "duplicate" | "skipped" | "failed"> {
+  const payload = event.payload as Record<string, unknown>;
+  const issueId = String(event.entityId ?? "");
+  if (!issueId) return "skipped";
+  const interactionId = String(payload.interactionId ?? "");
+  const interactionKind = String(payload.interactionKind ?? "");
+  if (!interactionId) return "skipped";
+  if (interactionKind !== "request_confirmation" && interactionKind !== "ask_user_questions") return "skipped";
+  if (!input.boardApiToken) {
+    ctx.logger.warn("Skipping interaction Telegram notification: board token missing", {
+      issueId,
+      interactionId,
+      interactionKind,
+    });
+    return "skipped";
+  }
+
+  let claimed = false;
+  try {
+    claimed = await claimInteractionDelivery(ctx, event.companyId, issueId, interactionId, interactionKind);
+    if (!claimed) return "duplicate";
+
+    const interaction = await fetchInteraction(ctx.http, {
+      baseUrl: input.baseUrl,
+      issueId,
+      interactionId,
+      boardApiToken: input.boardApiToken,
+    });
+    if (!interaction) {
+      await releaseInteractionDeliveryClaim(ctx, event.companyId, issueId, interactionId);
+      return "skipped";
+    }
+
+    let issue: Issue | null = null;
+    try {
+      issue = await ctx.issues.get(issueId, event.companyId);
+    } catch { /* best effort */ }
+
+    payload.interaction = interaction;
+    payload.issueIdentifier = issue?.identifier ?? issueId;
+    payload.issueTitle = issue?.title ?? null;
+    payload.interactionKind = interactionKind;
+
+    const interactionPayload = toRecord(interaction.payload);
+    const questions = Array.isArray(interactionPayload.questions)
+      ? interactionPayload.questions
+          .map((question) => {
+            const q = toRecord(question);
+            const id = firstNonEmptyString(q, ["id"]);
+            if (!id) return null;
+            const selectionMode = q.selectionMode === "multi" ? "multi" : "single";
+            const options = Array.isArray(q.options)
+              ? q.options
+                  .map((option) => {
+                    const o = toRecord(option);
+                    const optionId = firstNonEmptyString(o, ["id"]);
+                    const label = firstNonEmptyString(o, ["label"]);
+                    if (!optionId || !label) return null;
+                    return { id: optionId, label };
+                  })
+                  .filter((option): option is { id: string; label: string } => Boolean(option))
+              : [];
+            return { id, selectionMode, options };
+          })
+          .filter((entry): entry is { id: string; selectionMode: "single" | "multi"; options: Array<{ id: string; label: string }> } => Boolean(entry))
+      : [];
+
+    const messageId = await input.notify(
+      event,
+      formatInteractionCreated,
+      input.approvalsChatId || input.defaultChatId,
+      {
+        entityType: "interaction",
+        issueId,
+        interactionId,
+        interactionKind,
+        interactionQuestions: questions,
+      },
+    );
+
+    if (!messageId) {
+      await releaseInteractionDeliveryClaim(ctx, event.companyId, issueId, interactionId);
+      return "failed";
+    }
+
+    try {
+      await recordInteractionDeliverySent(ctx, event.companyId, issueId, interactionId, messageId);
+    } catch (err) {
+      ctx.logger.warn("Could not record Telegram interaction delivery as sent", {
+        issueId,
+        interactionId,
+        interactionKind,
+        error: String(err),
+      });
+    }
+    return "sent";
+  } catch (err) {
+    if (claimed) {
+      try {
+        await releaseInteractionDeliveryClaim(ctx, event.companyId, issueId, interactionId);
+      } catch (releaseErr) {
+        ctx.logger.error("Failed to release unsent interaction delivery claim", {
+          issueId,
+          interactionId,
+          interactionKind,
+          error: String(releaseErr),
+        });
+      }
+    }
+    ctx.logger.error("Failed to dispatch interaction notification", {
+      issueId,
+      interactionId,
+      interactionKind,
+      error: String(err),
+    });
+    return "failed";
+  }
+}
+
 const plugin = definePlugin({
   async setup(ctx) {
+    assertInteractionDeliveriesNamespace(ctx);
+
     const rawConfig = await ctx.config.get();
     ctx.logger.info("Telegram plugin config loaded");
     const config = rawConfig as unknown as TelegramConfig;
@@ -600,93 +763,13 @@ const plugin = definePlugin({
     }
 
     ctx.events.on("issue.interaction.created" as never, async (event: PluginEvent) => {
-      const payload = event.payload as Record<string, unknown>;
-      const issueId = String(event.entityId ?? "");
-      if (!issueId) return;
-      const interactionId = String(payload.interactionId ?? "");
-      const interactionKind = String(payload.interactionKind ?? "");
-      if (!interactionId) return;
-      if (interactionKind !== "request_confirmation" && interactionKind !== "ask_user_questions") return;
-      if (!boardApiToken) {
-        ctx.logger.warn("Skipping interaction Telegram notification: board token missing", {
-          issueId,
-          interactionId,
-          interactionKind,
-        });
-        return;
-      }
-
-      try {
-        const claimed = await claimInteractionDelivery(ctx, event.companyId, issueId, interactionId, interactionKind);
-        if (!claimed) return;
-
-        const [issue, interaction] = await Promise.all([
-          ctx.issues.get(issueId, event.companyId),
-          fetchInteraction(ctx.http, {
-            baseUrl,
-            issueId,
-            interactionId,
-            boardApiToken,
-          }),
-        ]);
-        if (!interaction) return;
-        payload.interaction = interaction;
-        payload.issueIdentifier = issue?.identifier ?? issueId;
-        payload.issueTitle = issue?.title ?? null;
-        payload.interactionKind = interactionKind;
-
-        const interactionPayload = toRecord(interaction.payload);
-        const questions = Array.isArray(interactionPayload.questions)
-          ? interactionPayload.questions
-              .map((question) => {
-                const q = toRecord(question);
-                const id = firstNonEmptyString(q, ["id"]);
-                if (!id) return null;
-                const selectionMode = q.selectionMode === "multi" ? "multi" : "single";
-                const options = Array.isArray(q.options)
-                  ? q.options
-                      .map((option) => {
-                        const o = toRecord(option);
-                        const optionId = firstNonEmptyString(o, ["id"]);
-                        const label = firstNonEmptyString(o, ["label"]);
-                        if (!optionId || !label) return null;
-                        return { id: optionId, label };
-                      })
-                      .filter((option): option is { id: string; label: string } => Boolean(option))
-                  : [];
-                return { id, selectionMode, options };
-              })
-              .filter((entry): entry is { id: string; selectionMode: "single" | "multi"; options: Array<{ id: string; label: string }> } => Boolean(entry))
-          : [];
-
-        const messageId = await notify(
-          event,
-          formatInteractionCreated,
-          config.approvalsChatId || config.defaultChatId,
-          {
-            entityType: "interaction",
-            issueId,
-            interactionId,
-            interactionKind,
-            interactionQuestions: questions,
-          },
-        );
-
-        if (messageId) {
-          try {
-            await recordInteractionDeliverySent(ctx, event.companyId, issueId, interactionId, messageId);
-          } catch {
-            // Best-effort status update; the pre-send claim already prevents duplicates.
-          }
-        }
-      } catch (err) {
-        ctx.logger.error("Failed to dispatch interaction notification", {
-          issueId,
-          interactionId,
-          interactionKind,
-          error: String(err),
-        });
-      }
+      await dispatchInteractionNotification(ctx, event, {
+        baseUrl,
+        boardApiToken,
+        defaultChatId: config.defaultChatId,
+        approvalsChatId: config.approvalsChatId,
+        notify,
+      });
     });
 
     if (config.notifyOnAgentError) {
