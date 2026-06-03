@@ -148,6 +148,12 @@ type StoredMessageMapping = {
   }>;
 };
 
+type InteractionDeliveryRecord = {
+  interactionId: string;
+  issueId: string;
+  sentAt: string;
+};
+
 function toRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {};
 }
@@ -369,13 +375,13 @@ const plugin = definePlugin({
       formatter: (e: PluginEvent, opts?: IssueLinksOpts) => { text: string; options: import("./telegram-api.js").SendMessageOptions },
       overrideChatId?: string,
       mappingOverride?: Partial<StoredMessageMapping>,
-    ) => {
+    ): Promise<number | null> => {
       const chatId = await resolveChat(
         ctx,
         event.companyId,
         overrideChatId || config.defaultChatId,
       );
-      if (!chatId) return;
+      if (!chatId) return null;
       const linksOpts = await resolveIssueLinksOpts(event.companyId);
       const msg = formatter(event, linksOpts);
 
@@ -427,12 +433,14 @@ const plugin = definePlugin({
           });
         } catch { /* best effort */ }
       }
+
+      return messageId;
     };
 
     if (config.notifyOnIssueCreated) {
-      ctx.events.on("issue.created", (event: PluginEvent) =>
-        notify(event, formatIssueCreated),
-      );
+      ctx.events.on("issue.created", async (event: PluginEvent) => {
+        await notify(event, formatIssueCreated);
+      });
     }
 
     if (config.notifyOnIssueDone) {
@@ -567,6 +575,18 @@ const plugin = definePlugin({
         return;
       }
 
+      const interactionDeliveryStateKey = `interaction_notification_${event.companyId}_${issueId}_${interactionId}`;
+      try {
+        const existingDelivery = await ctx.state.get({
+          scopeKind: "instance",
+          stateKey: interactionDeliveryStateKey,
+        }) as InteractionDeliveryRecord | null;
+        if (existingDelivery?.interactionId === interactionId) return;
+      } catch {
+        // If state cannot be read in this host invocation path, continue
+        // without dedupe; notification still has best-effort fallback behavior.
+      }
+
       try {
         const [issue, interaction] = await Promise.all([
           ctx.issues.get(issueId, event.companyId),
@@ -607,7 +627,7 @@ const plugin = definePlugin({
               .filter((entry): entry is { id: string; selectionMode: "single" | "multi"; options: Array<{ id: string; label: string }> } => Boolean(entry))
           : [];
 
-        await notify(
+        const messageId = await notify(
           event,
           formatInteractionCreated,
           config.approvalsChatId || config.defaultChatId,
@@ -619,6 +639,26 @@ const plugin = definePlugin({
             interactionQuestions: questions,
           },
         );
+
+        if (messageId) {
+          try {
+            const record: InteractionDeliveryRecord = {
+              interactionId,
+              issueId,
+              sentAt: new Date().toISOString(),
+            };
+            await ctx.state.set(
+              {
+                scopeKind: "instance",
+                stateKey: interactionDeliveryStateKey,
+              },
+              record,
+            );
+          } catch {
+            // Best-effort dedupe persistence; messages are already sent so
+            // this is okay to skip.
+          }
+        }
       } catch (err) {
         ctx.logger.error("Failed to dispatch interaction notification", {
           issueId,
@@ -630,20 +670,20 @@ const plugin = definePlugin({
     });
 
     if (config.notifyOnAgentError) {
-      ctx.events.on("agent.run.failed", (event: PluginEvent) =>
-        notify(event, formatAgentError, config.errorsChatId),
-      );
+      ctx.events.on("agent.run.failed", async (event: PluginEvent) => {
+        await notify(event, formatAgentError, config.errorsChatId);
+      });
     }
 
     if (config.notifyOnAgentRunStarted) {
-      ctx.events.on("agent.run.started", (event: PluginEvent) =>
-        notify(event, formatAgentRunStarted),
-      );
+      ctx.events.on("agent.run.started", async (event: PluginEvent) => {
+        await notify(event, formatAgentRunStarted);
+      });
     }
     if (config.notifyOnAgentRunFinished) {
-      ctx.events.on("agent.run.finished", (event: PluginEvent) =>
-        notify(event, formatAgentRunFinished),
-      );
+      ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
+        await notify(event, formatAgentRunFinished);
+      });
     }
 
     if (config.notifyOnIssueBlocked) {
