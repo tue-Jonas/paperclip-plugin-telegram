@@ -148,13 +148,6 @@ type StoredMessageMapping = {
   }>;
 };
 
-type DatabasePluginContext = PluginContext & {
-  db: {
-    namespace: string;
-    execute(sql: string, params?: unknown[]): Promise<{ rowCount: number }>;
-  };
-};
-
 function toRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {};
 }
@@ -265,7 +258,7 @@ async function claimInteractionDelivery(
   interactionId: string,
   interactionKind: string,
 ): Promise<boolean> {
-  const db = (ctx as DatabasePluginContext).db;
+  const db = ctx.db;
   const deliveryKey = `${companyId}:${issueId}:${interactionId}`;
   const result = await db.execute(
     `INSERT INTO ${pluginTableName(db.namespace, "interaction_deliveries")}
@@ -284,7 +277,7 @@ async function recordInteractionDeliverySent(
   interactionId: string,
   telegramMessageId: number,
 ): Promise<void> {
-  const db = (ctx as DatabasePluginContext).db;
+  const db = ctx.db;
   const deliveryKey = `${companyId}:${issueId}:${interactionId}`;
   await db.execute(
     `UPDATE ${pluginTableName(db.namespace, "interaction_deliveries")}
