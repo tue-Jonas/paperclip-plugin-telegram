@@ -148,6 +148,13 @@ type StoredMessageMapping = {
   }>;
 };
 
+type DatabasePluginContext = PluginContext & {
+  db: {
+    namespace: string;
+    execute(sql: string, params?: unknown[]): Promise<{ rowCount: number }>;
+  };
+};
+
 function toRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {};
 }
@@ -238,6 +245,53 @@ async function resolveChat(
 // then the chatId. See host-api.ts.
 function resolveCompanyId(config: HostApiConfig, chatId: string): string {
   return resolveCompanyIdFromMap(chatId, config);
+}
+
+function quoteIdentifier(value: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
+    throw new Error(`Unsafe SQL identifier: ${value}`);
+  }
+  return `"${value.replaceAll("\"", "\"\"")}"`;
+}
+
+function pluginTableName(namespace: string, table: string): string {
+  return `${quoteIdentifier(namespace)}.${quoteIdentifier(table)}`;
+}
+
+async function claimInteractionDelivery(
+  ctx: PluginContext,
+  companyId: string,
+  issueId: string,
+  interactionId: string,
+  interactionKind: string,
+): Promise<boolean> {
+  const db = (ctx as DatabasePluginContext).db;
+  const deliveryKey = `${companyId}:${issueId}:${interactionId}`;
+  const result = await db.execute(
+    `INSERT INTO ${pluginTableName(db.namespace, "interaction_deliveries")}
+       (delivery_key, company_id, issue_id, interaction_id, interaction_kind)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (delivery_key) DO NOTHING`,
+    [deliveryKey, companyId, issueId, interactionId, interactionKind],
+  );
+  return (result.rowCount ?? 0) > 0;
+}
+
+async function recordInteractionDeliverySent(
+  ctx: PluginContext,
+  companyId: string,
+  issueId: string,
+  interactionId: string,
+  telegramMessageId: number,
+): Promise<void> {
+  const db = (ctx as DatabasePluginContext).db;
+  const deliveryKey = `${companyId}:${issueId}:${interactionId}`;
+  await db.execute(
+    `UPDATE ${pluginTableName(db.namespace, "interaction_deliveries")}
+     SET telegram_message_id = $2, sent_at = now()
+     WHERE delivery_key = $1`,
+    [deliveryKey, String(telegramMessageId)],
+  );
 }
 
 const plugin = definePlugin({
@@ -369,13 +423,13 @@ const plugin = definePlugin({
       formatter: (e: PluginEvent, opts?: IssueLinksOpts) => { text: string; options: import("./telegram-api.js").SendMessageOptions },
       overrideChatId?: string,
       mappingOverride?: Partial<StoredMessageMapping>,
-    ) => {
+    ): Promise<number | null> => {
       const chatId = await resolveChat(
         ctx,
         event.companyId,
         overrideChatId || config.defaultChatId,
       );
-      if (!chatId) return;
+      if (!chatId) return null;
       const linksOpts = await resolveIssueLinksOpts(event.companyId);
       const msg = formatter(event, linksOpts);
 
@@ -427,12 +481,14 @@ const plugin = definePlugin({
           });
         } catch { /* best effort */ }
       }
+
+      return messageId;
     };
 
     if (config.notifyOnIssueCreated) {
-      ctx.events.on("issue.created", (event: PluginEvent) =>
-        notify(event, formatIssueCreated),
-      );
+      ctx.events.on("issue.created", async (event: PluginEvent) => {
+        await notify(event, formatIssueCreated);
+      });
     }
 
     if (config.notifyOnIssueDone) {
@@ -568,6 +624,9 @@ const plugin = definePlugin({
       }
 
       try {
+        const claimed = await claimInteractionDelivery(ctx, event.companyId, issueId, interactionId, interactionKind);
+        if (!claimed) return;
+
         const [issue, interaction] = await Promise.all([
           ctx.issues.get(issueId, event.companyId),
           fetchInteraction(ctx.http, {
@@ -607,7 +666,7 @@ const plugin = definePlugin({
               .filter((entry): entry is { id: string; selectionMode: "single" | "multi"; options: Array<{ id: string; label: string }> } => Boolean(entry))
           : [];
 
-        await notify(
+        const messageId = await notify(
           event,
           formatInteractionCreated,
           config.approvalsChatId || config.defaultChatId,
@@ -619,6 +678,14 @@ const plugin = definePlugin({
             interactionQuestions: questions,
           },
         );
+
+        if (messageId) {
+          try {
+            await recordInteractionDeliverySent(ctx, event.companyId, issueId, interactionId, messageId);
+          } catch {
+            // Best-effort status update; the pre-send claim already prevents duplicates.
+          }
+        }
       } catch (err) {
         ctx.logger.error("Failed to dispatch interaction notification", {
           issueId,
@@ -630,20 +697,20 @@ const plugin = definePlugin({
     });
 
     if (config.notifyOnAgentError) {
-      ctx.events.on("agent.run.failed", (event: PluginEvent) =>
-        notify(event, formatAgentError, config.errorsChatId),
-      );
+      ctx.events.on("agent.run.failed", async (event: PluginEvent) => {
+        await notify(event, formatAgentError, config.errorsChatId);
+      });
     }
 
     if (config.notifyOnAgentRunStarted) {
-      ctx.events.on("agent.run.started", (event: PluginEvent) =>
-        notify(event, formatAgentRunStarted),
-      );
+      ctx.events.on("agent.run.started", async (event: PluginEvent) => {
+        await notify(event, formatAgentRunStarted);
+      });
     }
     if (config.notifyOnAgentRunFinished) {
-      ctx.events.on("agent.run.finished", (event: PluginEvent) =>
-        notify(event, formatAgentRunFinished),
-      );
+      ctx.events.on("agent.run.finished", async (event: PluginEvent) => {
+        await notify(event, formatAgentRunFinished);
+      });
     }
 
     if (config.notifyOnIssueBlocked) {
