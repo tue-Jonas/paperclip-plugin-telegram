@@ -52,7 +52,11 @@ import {
   updateIssue,
 } from "./host-api.js";
 import { fetchApprovalContext, submitApprovalDecision } from "./approvals-api.js";
-import { fetchInteraction, respondInteraction } from "./interactions-api.js";
+import {
+  fetchInteraction,
+  isAlreadyResolvedInteractionError,
+  respondInteraction,
+} from "./interactions-api.js";
 
 type TelegramConfig = {
   telegramBotTokenRef: string;
@@ -1524,7 +1528,7 @@ export async function handleInboxWake(
   }
 }
 
-async function handleCallbackQuery(
+export async function handleCallbackQuery(
   ctx: PluginContext,
   token: string,
   query: NonNullable<TelegramUpdate["callback_query"]>,
@@ -1607,6 +1611,24 @@ async function handleCallbackQuery(
         { parseMode: "MarkdownV2" },
       );
     } catch (err) {
+      if (isAlreadyResolvedInteractionError(err)) {
+        await answerCallbackQuery(ctx, token, query.id, "Already resolved");
+        ctx.logger.info("Ignored stale Telegram interaction callback", {
+          issueId: mapping.issueId,
+          interactionId: mapping.interactionId,
+          action,
+          actor,
+        });
+        await editMessage(
+          ctx,
+          token,
+          chatId,
+          messageId,
+          escapeMarkdownV2("This interaction was already resolved."),
+          { parseMode: "MarkdownV2" },
+        );
+        return;
+      }
       await answerCallbackQuery(ctx, token, query.id, `Failed: ${String(err)}`);
     }
     return;
