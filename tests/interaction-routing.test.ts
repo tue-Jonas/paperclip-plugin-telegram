@@ -147,6 +147,14 @@ describe("routeInteractionResponse", () => {
     expect(String(reject!.body.reason)).toContain(text);
   });
 
+  it("accepts on a colloquial affirmative ('ok'), not just 'yes'/'accept'", async () => {
+    const ctx = makeCtx({ calls, sent, metrics });
+    const result = await routeInteractionResponse(ctx, BASE_URL, "pcp_board_test", DECISION_MAPPING, "ok");
+    expect(result).toBe("routed");
+    expect(calls.some((c) => c.url.endsWith("/accept"))).toBe(true);
+    expect(calls.some((c) => c.url.endsWith("/reject"))).toBe(false);
+  });
+
   it("reports already-resolved when the decision was decided elsewhere", async () => {
     const ctx = makeCtx({
       calls, sent, metrics,
@@ -210,6 +218,27 @@ describe("handleUpdate decision association", () => {
 
     expect(calls.some((c) => /\/api\/companies\/[^/]+\/issues$/.test(c.url) && c.method === "POST")).toBe(true);
     expect(calls.some((c) => c.url.includes("/interactions/"))).toBe(false);
+    expect(sent.some((m) => m.text.includes("Forwarded to agent"))).toBe(true);
+  });
+
+  it("does not trap the inbox: a stale ask_user_questions pending falls through to inbox, no bounce", async () => {
+    // Regression guard for the ask_user_questions inbox-trap (TWX-456 finding #1):
+    // a free-text message while such a record is pending must self-heal to inbox,
+    // never bounce indefinitely.
+    const ctx = makeCtx({
+      calls, sent, metrics,
+      pendingDecision: { ...DECISION_MAPPING, interactionKind: "ask_user_questions", interactionQuestions: [] },
+    });
+    await handleUpdate(
+      ctx, "tg-token", CONFIG,
+      textUpdate("a brand new unrelated task"),
+      BASE_URL, undefined, "pcp_board_test",
+    );
+
+    // No structured answer could be parsed, so no interaction call was made...
+    expect(calls.some((c) => c.url.includes("/interactions/"))).toBe(false);
+    // ...and instead of bouncing, the message became a fresh inbox issue.
+    expect(calls.some((c) => /\/api\/companies\/[^/]+\/issues$/.test(c.url) && c.method === "POST")).toBe(true);
     expect(sent.some((m) => m.text.includes("Forwarded to agent"))).toBe(true);
   });
 

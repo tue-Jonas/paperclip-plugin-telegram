@@ -404,7 +404,11 @@ export async function routeInteractionResponse(
   try {
     if (mapping.interactionKind === "request_confirmation") {
       const normalized = text.trim().toLowerCase();
-      if (["accept", "approve", "yes", "y"].includes(normalized)) {
+      const affirmatives = [
+        "accept", "approve", "approved", "yes", "y", "yep", "yeah", "yup",
+        "ok", "okay", "sure", "confirm", "confirmed", "👍", "✅",
+      ];
+      if (affirmatives.includes(normalized)) {
         await respondInteraction(ctx.http, {
           baseUrl, issueId, interactionId, action: "accept", boardApiToken,
         });
@@ -757,8 +761,20 @@ const plugin = definePlugin({
 
         // TWX-455: remember the pending decision for this chat so a free-text
         // (non-native-reply) response routes back to the decision instead of
-        // spawning a new inbox issue.
-        if (mapping.entityType === "interaction" && mapping.interactionId) {
+        // spawning a new inbox issue. Only request_confirmation is recorded:
+        // it is the kind that meaningfully accepts arbitrary free text (as a
+        // needs-changes reject-with-reason). ask_user_questions needs a
+        // structured answer that can't be inferred from free text, and other
+        // kinds (suggest_tasks, …) aren't routable here at all — recording them
+        // would trap the chat's inbox (every later free-text message bounces or
+        // is skipped) and leave an uncleared pending record. Those kinds still
+        // route correctly via the native swipe-reply path; their free text
+        // falls through to inbox as before.
+        if (
+          mapping.entityType === "interaction" &&
+          mapping.interactionId &&
+          mapping.interactionKind === "request_confirmation"
+        ) {
           await recordPendingDecision(ctx, chatId, mapping);
         }
 
@@ -1417,7 +1433,7 @@ export async function handleUpdate(
   // decision is pending for this chat is a response to that decision, not a
   // fresh inbox item. Route it to the decision's own issue. Native swipe-replies
   // are handled further down via the msg_<chat>_<reply> mapping. ---
-  if (!threadId && !isReply) {
+  if (!threadId && !isReply && !text.startsWith("/")) {
     const pending = await getPendingDecision(ctx, chatId);
     if (pending) {
       const result = await routeInteractionResponse(ctx, baseUrl, boardApiToken, pending, text);
@@ -1432,14 +1448,10 @@ export async function handleUpdate(
         // message fall through to inbox as a fresh item.
         await clearPendingDecision(ctx, chatId);
       } else if (result === "needs-input") {
-        await sendMessage(
-          ctx,
-          token,
-          chatId,
-          "This decision needs a structured answer. Use: question_id=option_id[,option_id]",
-          {},
-        );
-        return;
+        // Only reachable for a stale/legacy ask_user_questions record (those are
+        // no longer recorded as pending). Don't trap the inbox — clear the
+        // record and let the message fall through as a fresh inbox item.
+        await clearPendingDecision(ctx, chatId);
       } else if (result === "missing-token" || result === "error") {
         // Don't silently spawn an inbox issue on a transient failure — tell the
         // user their reply didn't land and to use the buttons.
