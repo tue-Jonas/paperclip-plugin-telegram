@@ -144,6 +144,7 @@ type StoredMessageMapping = {
   companyId: string;
   eventType?: string;
   issueId?: string;
+  issueIdentifier?: string;
   approvalId?: string;
   interactionId?: string;
   interactionKind?: string;
@@ -316,6 +317,127 @@ async function recordInteractionDeliverySent(
   );
 }
 
+// --- Pending-decision tracking (TWX-455) ---------------------------------
+// A "Decision needed" interaction delivered to a chat puts that chat into a
+// modal state: the board owes a decision. The board user frequently answers by
+// typing a free-text message rather than tapping a button or using Telegram's
+// swipe-to-reply. Without native-reply context we cannot key off the replied-to
+// message, so we track the most recent unresolved decision per chat and treat
+// the next top-level text as a response to it (instead of spawning a new inbox
+// issue). The record is cleared once the decision is resolved (button, reply,
+// or text response), so once nothing is pending top-level text is inbox again.
+function pendingDecisionKey(chatId: string): string {
+  return `pending_decision_${chatId}`;
+}
+
+async function recordPendingDecision(
+  ctx: PluginContext,
+  chatId: string,
+  mapping: StoredMessageMapping,
+): Promise<void> {
+  if (!mapping.issueId || !mapping.interactionId) return;
+  try {
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: pendingDecisionKey(chatId) },
+      mapping,
+    );
+  } catch { /* best effort */ }
+}
+
+async function getPendingDecision(
+  ctx: PluginContext,
+  chatId: string,
+): Promise<StoredMessageMapping | null> {
+  let record: StoredMessageMapping | null = null;
+  try {
+    record = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: pendingDecisionKey(chatId),
+    }) as StoredMessageMapping | null;
+  } catch {
+    return null;
+  }
+  if (!record || !record.issueId || !record.interactionId) return null;
+  return record;
+}
+
+async function clearPendingDecision(ctx: PluginContext, chatId: string): Promise<void> {
+  try {
+    // No state.delete in the SDK; a tombstone with no interactionId reads as
+    // "nothing pending" via getPendingDecision().
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: pendingDecisionKey(chatId) },
+      { entityType: "interaction", companyId: "", resolved: true },
+    );
+  } catch { /* best effort */ }
+}
+
+export type InteractionResponseResult =
+  | "routed"
+  | "needs-input"
+  | "already-resolved"
+  | "missing-token"
+  | "error"
+  | "skipped";
+
+/**
+ * Turn a Telegram text reply into a response on the originating decision's
+ * interaction. Shared by the native-reply path and the pending-decision path.
+ *
+ * For request_confirmation: affirmative keywords accept; everything else —
+ * explicit "no" OR an arbitrary free-text message — is a reject-with-reason so
+ * the agent wakes on the decision's own issue with the board's instructions
+ * (TWX-455). Free text is "needs changes", never a bounce.
+ */
+export async function routeInteractionResponse(
+  ctx: PluginContext,
+  baseUrl: string,
+  boardApiToken: string,
+  mapping: StoredMessageMapping,
+  text: string,
+): Promise<InteractionResponseResult> {
+  if (!mapping.issueId || !mapping.interactionId) return "skipped";
+  if (!boardApiToken) return "missing-token";
+
+  const issueId = mapping.issueId;
+  const interactionId = mapping.interactionId;
+  try {
+    if (mapping.interactionKind === "request_confirmation") {
+      const normalized = text.trim().toLowerCase();
+      if (["accept", "approve", "yes", "y"].includes(normalized)) {
+        await respondInteraction(ctx.http, {
+          baseUrl, issueId, interactionId, action: "accept", boardApiToken,
+        });
+      } else {
+        const reason = ["reject", "no", "n"].includes(normalized)
+          ? `Telegram reply: ${text}`
+          : `Needs changes (Telegram reply): ${text}`;
+        await respondInteraction(ctx.http, {
+          baseUrl, issueId, interactionId, action: "reject", boardApiToken, reason,
+        });
+      }
+    } else if (mapping.interactionKind === "ask_user_questions") {
+      const answers = parseAskQuestionsAnswers(text, mapping.interactionQuestions);
+      if (answers.length === 0) return "needs-input";
+      await respondInteraction(ctx.http, {
+        baseUrl, issueId, interactionId, action: "respond", boardApiToken, answers,
+      });
+    } else {
+      return "skipped";
+    }
+    await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+    return "routed";
+  } catch (err) {
+    if (isAlreadyResolvedInteractionError(err)) return "already-resolved";
+    ctx.logger.error("Failed to route interaction reply", {
+      issueId,
+      interactionId,
+      error: String(err),
+    });
+    return "error";
+  }
+}
+
 type InteractionNotify = (
   event: PluginEvent,
   formatter: (e: PluginEvent, opts?: IssueLinksOpts) => { text: string; options: import("./telegram-api.js").SendMessageOptions },
@@ -407,6 +529,7 @@ export async function dispatchInteractionNotification(
       {
         entityType: "interaction",
         issueId,
+        issueIdentifier: issue?.identifier ?? issueId,
         interactionId,
         interactionKind,
         interactionQuestions: questions,
@@ -631,6 +754,13 @@ const plugin = definePlugin({
             mapping,
           );
         } catch { /* best effort */ }
+
+        // TWX-455: remember the pending decision for this chat so a free-text
+        // (non-native-reply) response routes back to the decision instead of
+        // spawning a new inbox issue.
+        if (mapping.entityType === "interaction" && mapping.interactionId) {
+          await recordPendingDecision(ctx, chatId, mapping);
+        }
 
         try {
           await ctx.activity.log({
@@ -1211,7 +1341,7 @@ const plugin = definePlugin({
   },
 });
 
-async function handleUpdate(
+export async function handleUpdate(
   ctx: PluginContext,
   token: string,
   config: TelegramConfig,
@@ -1281,11 +1411,55 @@ async function handleUpdate(
     return;
   }
 
+  const isReply = !!msg.reply_to_message;
+
+  // --- Pending decision (TWX-455): a top-level free-text message while a
+  // decision is pending for this chat is a response to that decision, not a
+  // fresh inbox item. Route it to the decision's own issue. Native swipe-replies
+  // are handled further down via the msg_<chat>_<reply> mapping. ---
+  if (!threadId && !isReply) {
+    const pending = await getPendingDecision(ctx, chatId);
+    if (pending) {
+      const result = await routeInteractionResponse(ctx, baseUrl, boardApiToken, pending, text);
+      if (result === "routed") {
+        await clearPendingDecision(ctx, chatId);
+        const label = pending.issueIdentifier ?? pending.issueId ?? "the decision";
+        await sendMessage(ctx, token, chatId, `Forwarded to decision — ${label}`, {});
+        return;
+      }
+      if (result === "already-resolved") {
+        // The decision was decided elsewhere; drop the stale state and let the
+        // message fall through to inbox as a fresh item.
+        await clearPendingDecision(ctx, chatId);
+      } else if (result === "needs-input") {
+        await sendMessage(
+          ctx,
+          token,
+          chatId,
+          "This decision needs a structured answer. Use: question_id=option_id[,option_id]",
+          {},
+        );
+        return;
+      } else if (result === "missing-token" || result === "error") {
+        // Don't silently spawn an inbox issue on a transient failure — tell the
+        // user their reply didn't land and to use the buttons.
+        await sendMessage(
+          ctx,
+          token,
+          chatId,
+          "Could not deliver your reply to the pending decision. Please use the buttons on the decision message.",
+          {},
+        );
+        return;
+      }
+      // "skipped" falls through to inbox handling below.
+    }
+  }
+
   // --- Inbox wake: plain text from the board → new issue for the configured agent ---
   // Fires only for top-level (non-thread, non-reply, non-command) text messages
   // in an allow-listed chat. Creates an issue assigned to inboxAgentId so the
   // agent wakes via the standard assignment path.
-  const isReply = !!msg.reply_to_message;
   const isInboxEligible =
     !!config.inboxAgentId &&
     !threadId &&
@@ -1393,78 +1567,44 @@ async function handleUpdate(
         });
       }
     } else if (mapping && mapping.entityType === "interaction" && mapping.issueId && mapping.interactionId) {
-      if (!boardApiToken) {
-        await sendMessage(
-          ctx,
-          token,
-          chatId,
-          escapeMarkdownV2("Cannot route interaction reply: board token is missing."),
-          { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
-        );
-        return;
-      }
-
-      try {
-        if (mapping.interactionKind === "request_confirmation") {
-          const normalized = text.trim().toLowerCase();
-          if (["accept", "approve", "yes", "y"].includes(normalized)) {
-            await respondInteraction(ctx.http, {
-              baseUrl,
-              issueId: mapping.issueId,
-              interactionId: mapping.interactionId,
-              action: "accept",
-              boardApiToken,
-            });
-          } else if (["reject", "no", "n"].includes(normalized)) {
-            await respondInteraction(ctx.http, {
-              baseUrl,
-              issueId: mapping.issueId,
-              interactionId: mapping.interactionId,
-              action: "reject",
-              boardApiToken,
-              reason: `Telegram reply: ${text}`,
-            });
-          } else {
-            await sendMessage(
-              ctx,
-              token,
-              chatId,
-              escapeMarkdownV2("Reply with 'accept' or 'reject' for this confirmation."),
-              { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
-            );
-            return;
-          }
-        } else if (mapping.interactionKind === "ask_user_questions") {
-          const answers = parseAskQuestionsAnswers(text, mapping.interactionQuestions);
-          if (answers.length === 0) {
-            await sendMessage(
-              ctx,
-              token,
-              chatId,
-              escapeMarkdownV2("No valid answers parsed. Use: question_id=option_id[,option_id]"),
-              { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
-            );
-            return;
-          }
-          await respondInteraction(ctx.http, {
-            baseUrl,
-            issueId: mapping.issueId,
-            interactionId: mapping.interactionId,
-            action: "respond",
-            boardApiToken,
-            answers,
-          });
-        } else {
-          return;
-        }
-        await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-        await markInboundRouted();
-      } catch (err) {
-        ctx.logger.error("Failed to route interaction reply", {
-          issueId: mapping.issueId,
-          interactionId: mapping.interactionId,
-          error: String(err),
-        });
+      const result = await routeInteractionResponse(ctx, baseUrl, boardApiToken, mapping, text);
+      switch (result) {
+        case "routed":
+          await clearPendingDecision(ctx, chatId);
+          await markInboundRouted();
+          break;
+        case "already-resolved":
+          await clearPendingDecision(ctx, chatId);
+          await sendMessage(
+            ctx,
+            token,
+            chatId,
+            escapeMarkdownV2("This decision was already resolved."),
+            { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+          );
+          break;
+        case "missing-token":
+          await sendMessage(
+            ctx,
+            token,
+            chatId,
+            escapeMarkdownV2("Cannot route interaction reply: board token is missing."),
+            { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+          );
+          break;
+        case "needs-input":
+          await sendMessage(
+            ctx,
+            token,
+            chatId,
+            escapeMarkdownV2("No valid answers parsed. Use: question_id=option_id[,option_id]"),
+            { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+          );
+          break;
+        default:
+          // "error" already logged inside routeInteractionResponse; "skipped"
+          // means nothing to do.
+          break;
       }
     }
   }
@@ -1601,6 +1741,7 @@ export async function handleCallbackQuery(
         action,
         boardApiToken,
       });
+      await clearPendingDecision(ctx, chatId);
       await answerCallbackQuery(ctx, token, query.id, action === "accept" ? "Accepted" : "Rejected");
       await editMessage(
         ctx,
@@ -1612,6 +1753,7 @@ export async function handleCallbackQuery(
       );
     } catch (err) {
       if (isAlreadyResolvedInteractionError(err)) {
+        await clearPendingDecision(ctx, chatId);
         await answerCallbackQuery(ctx, token, query.id, "Already resolved");
         ctx.logger.info("Ignored stale Telegram interaction callback", {
           issueId: mapping.issueId,
