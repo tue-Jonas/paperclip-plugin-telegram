@@ -37,6 +37,11 @@ type InteractionQuestion = {
   required?: boolean;
 };
 
+type InteractionPresentation = {
+  emoji: string;
+  title: string;
+};
+
 function isExternalUrl(url?: string): boolean {
   return !!url && url.startsWith("https://");
 }
@@ -96,6 +101,49 @@ function formatOptionList(options: string[]): string | null {
   const preview = options.slice(0, 6).map((option) => `• ${esc(option)}`);
   if (options.length > 6) preview.push(`• ${esc(`+${String(options.length - 6)} more`)}`);
   return preview.join("\n");
+}
+
+function normalizeParagraphs(value: string): string {
+  return value
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+const ISSUE_IDENTIFIER_RE = /([A-Z][A-Z0-9]+-\d+)/g;
+const ISSUE_PATH_RE = /\/issues\/([A-Z][A-Z0-9]+-\d+)/g;
+
+function formatTextWithIssueLinks(value: string, opts?: IssueLinksOpts): string {
+  const withPathIdentifiers = value.replace(ISSUE_PATH_RE, (_match, identifier: string) => identifier);
+  const segments: string[] = [];
+  let from = 0;
+  const matches = withPathIdentifiers.matchAll(ISSUE_IDENTIFIER_RE);
+  for (const match of matches) {
+    const start = match.index ?? 0;
+    const end = start + match[0].length;
+    if (start > from) segments.push(esc(withPathIdentifiers.slice(from, start)));
+    segments.push(issueLink(match[1], opts));
+    from = end;
+  }
+  if (from < withPathIdentifiers.length) segments.push(esc(withPathIdentifiers.slice(from)));
+  return segments.join("");
+}
+
+function formatDetailsBlock(details: string, maxLen: number = 900, opts?: IssueLinksOpts): string[] {
+  const normalized = normalizeParagraphs(details);
+  if (!normalized) return [];
+  const truncated = truncateAtWord(normalized, maxLen);
+  return ["", bold("Details"), formatTextWithIssueLinks(truncated, opts)];
+}
+
+function interactionPresentation(kind: string): InteractionPresentation {
+  if (kind === "request_confirmation") {
+    return { emoji: "🟢", title: "Decision needed" };
+  }
+  if (kind === "ask_user_questions") {
+    return { emoji: "❓", title: "Questions for you" };
+  }
+  return { emoji: "💬", title: "Interaction" };
 }
 
 function parseInteractionQuestions(value: unknown): InteractionQuestion[] {
@@ -204,7 +252,7 @@ export function formatIssueDone(event: PluginEvent, opts?: IssueLinksOpts): Form
 
 export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
-  const approvalType = String(p.type ?? "unknown");
+  const approvalType = String(p.type ?? "approval").replace(/_/g, " ");
   const approvalId = String(p.approvalId ?? event.entityId);
   const title = String(p.title ?? "Approval Requested");
   const detailPayload = asPayload(p.approvalPayload);
@@ -226,14 +274,14 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
   const agentName = p.agentName ? String(p.agentName) : null;
 
   const lines: string[] = [
-    `${esc("🔔")} ${bold("Approval Requested")}`,
-    `${bold("Request")}: ${esc(prompt)}`,
+    `${esc("🔔")} ${bold("Approval needed")}`,
+    bold(prompt),
   ];
 
-  lines.push(`${bold("Type")}: ${code(approvalType)}`);
-  if (agentName) lines.push(`${bold("Requested By")}: ${esc(agentName)}`);
-  if (summary) lines.push(`${bold("Summary / Why")}: ${esc(truncateAtWord(summary, 500))}`);
-  if (detailsMarkdown) lines.push(`${bold("Details")}: ${esc(truncateAtWord(detailsMarkdown, 500))}`);
+  lines.push(`${bold("Type")}: ${esc(approvalType)}`);
+  if (agentName) lines.push(`${bold("Requested by")}: ${esc(agentName)}`);
+  if (summary) lines.push(`${bold("Why")}: ${esc(truncateAtWord(summary, 500))}`);
+  if (detailsMarkdown) lines.push(...formatDetailsBlock(detailsMarkdown, 900, opts));
   const optionsBlock = formatOptionList(options);
   if (optionsBlock) lines.push(`${bold("Options")}:\n${optionsBlock}`);
   if (recommendedDefault) lines.push(`${bold("Recommended Default")}: ${esc(recommendedDefault)}`);
@@ -283,17 +331,16 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
 
 export function formatInteractionCreated(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
   const p = event.payload as Payload;
-  const interactionId = String(p.interactionId ?? "interaction");
   const kind = String(p.interactionKind ?? "unknown");
   const issueIdentifier = String(p.issueIdentifier ?? event.entityId);
   const issueTitle = stringOrNull(p.issueTitle);
   const interaction = asPayload(p.interaction);
   const interactionPayload = asPayload(interaction.payload);
+  const header = interactionPresentation(kind);
+  const issueSummary = `${issueLink(issueIdentifier, opts)}${issueTitle ? ` ${esc("·")} ${esc(issueTitle)}` : ""}`;
 
   const lines: string[] = [
-    `${esc("💬")} ${bold("Decision Interaction")}`,
-    `${bold("Issue")}: ${issueLink(issueIdentifier, opts)}${issueTitle ? ` ${esc(issueTitle)}` : ""}`,
-    `${bold("Kind")}: ${code(kind)}`,
+    `${esc(header.emoji)} ${bold(header.title)} ${esc("—")} ${issueSummary}`,
   ];
 
   const keyboard: Array<Array<{ text: string; callback_data?: string; url?: string }>> = [];
@@ -303,8 +350,8 @@ export function formatInteractionCreated(event: PluginEvent, opts?: IssueLinksOp
     const details = firstNonEmptyString(interactionPayload, ["detailsMarkdown"]);
     const acceptLabel = firstNonEmptyString(interactionPayload, ["acceptLabel"]) ?? "Accept";
     const rejectLabel = firstNonEmptyString(interactionPayload, ["rejectLabel"]) ?? "Reject";
-    lines.push(`${bold("Prompt")}: ${esc(prompt)}`);
-    if (details) lines.push(`${bold("Details")}: ${esc(truncateAtWord(details, 600))}`);
+    lines.push("", bold(prompt));
+    if (details) lines.push(...formatDetailsBlock(details, 1000, opts));
     keyboard.push([
       { text: acceptLabel, callback_data: "interaction_accept" },
       { text: rejectLabel, callback_data: "interaction_reject" },
@@ -312,19 +359,18 @@ export function formatInteractionCreated(event: PluginEvent, opts?: IssueLinksOp
   } else if (kind === "ask_user_questions") {
     const title = firstNonEmptyString(interactionPayload, ["title"]) ?? "Please answer the questions below.";
     const questions = parseInteractionQuestions(interactionPayload.questions);
-    lines.push(`${bold("Prompt")}: ${esc(title)}`);
-    for (const question of questions.slice(0, 4)) {
-      lines.push(`\n${bold(question.id)}: ${esc(question.prompt)}`);
+    lines.push("", bold(title));
+    for (const [index, question] of questions.slice(0, 4).entries()) {
+      lines.push(`\n${bold(`Q${String(index + 1)}`)} ${esc(question.prompt)}`);
       for (const option of question.options.slice(0, 6)) {
-        lines.push(`• ${esc(option.id)} = ${esc(option.label)}`);
+        lines.push(`• ${esc(option.label)}`);
       }
       if (question.options.length > 6) lines.push(`• ${esc(`+${String(question.options.length - 6)} more`)}`);
     }
-    lines.push(
-      `\n${esc("Reply format")}: ${code("question_id=option_id[,option_id]")}`,
-    );
+    if (keyboard.length === 0) lines.push("\n" + esc("Reply with option labels. For multiple questions: Q1: <option label>"));
   } else {
-    lines.push(`${bold("Interaction ID")}: ${code(interactionId)}`);
+    const fallbackPrompt = firstNonEmptyString(interactionPayload, ["prompt", "title", "question"]);
+    if (fallbackPrompt) lines.push("", bold(fallbackPrompt));
   }
 
   const issueLinkButton = issueButton(issueIdentifier, opts);
@@ -349,8 +395,10 @@ export function formatAgentError(event: PluginEvent, opts?: IssueLinksOpts): For
   return {
     text: [
       `${esc("❌")} ${bold("Agent Error")}`,
-      `${bold(agentName)} ${esc("encountered an error")}`,
-      `\n${code(truncateAtWord(errorMessage, 500))}`,
+      `${bold(agentName)} ${esc("hit an error")}`,
+      "",
+      bold("Details"),
+      esc(truncateAtWord(errorMessage, 500)),
     ].join("\n"),
     options: {
       parseMode: "MarkdownV2",
@@ -405,4 +453,97 @@ export function formatAgentRunFinished(event: PluginEvent, opts?: IssueLinksOpts
       ...(buttons.length > 0 ? { inlineKeyboard: [buttons] } : {}),
     },
   };
+}
+
+export function formatIssueBlocked(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
+  const p = event.payload as Payload;
+  const identifier = String(p.identifier ?? event.entityId);
+  const title = String(p.title ?? "");
+  const assigneeName = p.assigneeName ? String(p.assigneeName) : null;
+  const comment = p.comment ? String(p.comment) : null;
+
+  const lines: string[] = [
+    `${esc("⛔")} ${bold("Issue Blocked")}: ${issueLink(identifier, opts)}`,
+    bold(title),
+  ];
+  if (assigneeName) lines.push(`Assignee: ${esc(assigneeName)}`);
+  if (comment) {
+    const truncated = truncateAtWord(comment, 300);
+    lines.push("", bold("Blocker"), esc(truncated));
+  }
+
+  const button = issueButton(identifier, opts);
+  return {
+    text: lines.join("\n"),
+    options: {
+      parseMode: "MarkdownV2",
+      ...(button ? { inlineKeyboard: [[button]] } : {}),
+    },
+  };
+}
+
+export function formatBoardMention(event: PluginEvent, opts?: IssueLinksOpts): FormattedMessage {
+  const p = event.payload as Payload;
+  const identifier = String(p.issueIdentifier ?? p.identifier ?? p.issueId ?? event.entityId);
+  const issueTitle = p.issueTitle ? String(p.issueTitle) : null;
+  const authorName = String(p.authorName ?? p.authorUsername ?? "someone");
+  const body = p.body ? String(p.body) : "";
+
+  const lines: string[] = [
+    `${esc("💬")} ${bold("Board mentioned")} on ${issueLink(identifier, opts)}`,
+  ];
+  if (issueTitle) lines.push(bold(issueTitle));
+  lines.push(`${bold(authorName)}:`);
+  if (body) {
+    const truncated = truncateAtWord(body, 400);
+    lines.push(`${esc(">")} ${esc(truncated)}`);
+  }
+
+  const button = issueButton(identifier, opts);
+  return {
+    text: lines.join("\n"),
+    options: {
+      parseMode: "MarkdownV2",
+      ...(button ? { inlineKeyboard: [[button]] } : {}),
+    },
+  };
+}
+
+/**
+ * Returns true if `body` contains a case-insensitive @mention of any username
+ * in `usernames`. Usernames may be provided with or without the leading `@`.
+ * Match requires a word boundary after the handle (so @jonasX doesn't match @jonas).
+ */
+export function commentMentionsBoard(body: string, usernames: string[]): boolean {
+  if (!body || !Array.isArray(usernames) || usernames.length === 0) return false;
+  const haystack = body.toLowerCase();
+  for (const raw of usernames) {
+    if (!raw) continue;
+    const handle = raw.replace(/^@/, "").trim().toLowerCase();
+    if (!handle) continue;
+    const needle = "@" + handle;
+    let from = 0;
+    while (true) {
+      const idx = haystack.indexOf(needle, from);
+      if (idx < 0) break;
+      const after = haystack.charCodeAt(idx + needle.length);
+      const isWordChar = (after >= 48 && after <= 57) || (after >= 97 && after <= 122) || after === 95;
+      if (!isWordChar) return true;
+      from = idx + needle.length;
+    }
+  }
+  return false;
+}
+
+/**
+ * Returns true when a chat is allowed to forward plain-text messages to the
+ * inbox agent. `defaultChatId` is always allowed; `inboxChatIds` widens the
+ * allow-list but if it contains any non-empty entry, it overrides the default
+ * (so operators can opt a subset in explicitly).
+ */
+export function isInboxChatAllowed(chatId: string, defaultChatId: string, inboxChatIds: string[]): boolean {
+  if (!chatId) return false;
+  const list = (inboxChatIds ?? []).map((id) => String(id).trim()).filter(Boolean);
+  if (list.length > 0) return list.includes(chatId);
+  return !!defaultChatId && chatId === String(defaultChatId);
 }

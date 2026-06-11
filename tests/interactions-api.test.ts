@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from "vitest";
-import { fetchInteraction, respondInteraction } from "../src/interactions-api.js";
+import {
+  PaperclipApiError,
+  fetchInteraction,
+  isAlreadyResolvedInteractionError,
+  respondInteraction,
+} from "../src/interactions-api.js";
 
 describe("fetchInteraction", () => {
   it("returns the matched interaction from list endpoint", async () => {
@@ -82,5 +87,41 @@ describe("respondInteraction", () => {
       }),
     );
   });
-});
 
+  it("classifies already-resolved Paperclip interaction conflicts", async () => {
+    const fetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 409,
+      text: vi.fn().mockResolvedValue('{"error":"Interaction has already been resolved"}'),
+    });
+
+    let caught: unknown;
+    try {
+      await respondInteraction(
+        { fetch },
+        {
+          baseUrl: "http://example.com",
+          issueId: "iss-1",
+          interactionId: "int-1",
+          action: "accept",
+          boardApiToken: "pcp_board_test",
+        },
+      );
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(PaperclipApiError);
+    expect(isAlreadyResolvedInteractionError(caught)).toBe(true);
+  });
+
+  it("does not classify other interaction conflicts as already resolved", async () => {
+    const error = new PaperclipApiError(
+      "Interaction accept failed",
+      409,
+      "Cannot accept interaction: the issue's most recent run has not completed workspace_finalize.",
+    );
+
+    expect(isAlreadyResolvedInteractionError(error)).toBe(false);
+  });
+});

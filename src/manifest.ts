@@ -26,6 +26,9 @@ const manifest: PaperclipPluginManifestV1 = {
     "agent.tools.register",
     "events.subscribe",
     "events.emit",
+    "database.namespace.migrate",
+    "database.namespace.read",
+    "database.namespace.write",
     "plugin.state.read",
     "plugin.state.write",
     "http.outbound",
@@ -37,6 +40,10 @@ const manifest: PaperclipPluginManifestV1 = {
   entrypoints: {
     worker: "./dist/worker.js",
   },
+  database: {
+    namespaceSlug: "telegram",
+    migrationsDir: "migrations",
+  },
   instanceConfigSchema: {
     type: "object",
     properties: {
@@ -46,8 +53,15 @@ const manifest: PaperclipPluginManifestV1 = {
         format: "secret-ref",
         title: "Telegram Bot Token (secret reference)",
         description:
-          "Secret UUID for your Telegram Bot token. Create the secret in Settings > Secrets, then paste its UUID here. Get a token from @BotFather.",
+          "Secret UUID for your Telegram Bot token. Create the secret in Settings > Secrets, then paste its UUID here. Get a token from @BotFather. Preferred once the host enables company-scoped plugin secret references.",
         default: DEFAULT_CONFIG.telegramBotTokenRef,
+      },
+      telegramBotToken: {
+        type: "string",
+        title: "Telegram Bot Token (inline)",
+        description:
+          "Raw Telegram Bot token from @BotFather. Use this on host builds where plugin secret references are disabled. If set, it takes precedence over telegramBotTokenRef. Stored in plugin config (not the encrypted secret store) — prefer telegramBotTokenRef when the host supports it.",
+        default: DEFAULT_CONFIG.telegramBotToken,
       },
       paperclipBaseUrl: {
         type: "string",
@@ -65,9 +79,9 @@ const manifest: PaperclipPluginManifestV1 = {
       },
       boardApiToken: {
         type: "string",
-        title: "Board API Token (advanced)",
+        title: "Board API Token (inline)",
         description:
-          "Inline Paperclip board API token (pcp_board_...). Used by approval callbacks when the host requires Authorization headers.",
+          "Inline Paperclip board API token (pcp_board_...). Used for approval callbacks plus inbound commands/inbox-wake on host builds that don't propagate an invocation scope into the poll loop. Prefer boardApiTokenRef when the host supports plugin secret references.",
         default: DEFAULT_CONFIG.boardApiToken,
       },
       boardApiTokenRef: {
@@ -75,8 +89,15 @@ const manifest: PaperclipPluginManifestV1 = {
         format: "secret-ref",
         title: "Board API Token (secret reference)",
         description:
-          "Secret UUID for a Paperclip board API token. Preferred over inline token.",
+          "Secret UUID for the board API token. Resolved via the un-gated ctx.secrets.resolve. Used if boardApiToken (inline) is empty.",
         default: DEFAULT_CONFIG.boardApiTokenRef,
+      },
+      defaultCompanyId: {
+        type: "string",
+        title: "Default Company ID",
+        description:
+          "Company used to resolve inbound commands + inbox-wake for chats that haven't run /connect (host state is unreadable from the poll loop under the invocation-scope bug). Set this to your primary company id.",
+        default: DEFAULT_CONFIG.defaultCompanyId,
       },
 
       // --- Chat routing ---
@@ -136,6 +157,59 @@ const manifest: PaperclipPluginManifestV1 = {
         type: "boolean",
         title: "Notify on agent error",
         default: DEFAULT_CONFIG.notifyOnAgentError,
+      },
+      notifyOnAgentRunStarted: {
+        type: "boolean",
+        title: "Notify on agent run started",
+        description:
+          "Forward agent.run.started events. Off by default to avoid chat flooding; board users typically only want started/finished when debugging.",
+        default: DEFAULT_CONFIG.notifyOnAgentRunStarted,
+      },
+      notifyOnAgentRunFinished: {
+        type: "boolean",
+        title: "Notify on agent run finished",
+        description:
+          "Forward agent.run.finished events. Off by default to avoid chat flooding.",
+        default: DEFAULT_CONFIG.notifyOnAgentRunFinished,
+      },
+      notifyOnIssueBlocked: {
+        type: "boolean",
+        title: "Notify on issue blocked (board users only)",
+        description:
+          "Forward issue.updated events where status transitions to 'blocked' and the issue is assigned to a board user (assigneeUserId set). Ignores issues assigned to other agents.",
+        default: DEFAULT_CONFIG.notifyOnIssueBlocked,
+      },
+      notifyOnBoardMention: {
+        type: "boolean",
+        title: "Notify on board mention in comment",
+        description:
+          "Forward issue.comment.created events when the comment body contains @<boardUsername> for any username in boardUsernames.",
+        default: DEFAULT_CONFIG.notifyOnBoardMention,
+      },
+      boardUsernames: {
+        type: "array",
+        items: { type: "string" },
+        title: "Board usernames (for @mention filter)",
+        description:
+          "List of usernames to watch for in comment bodies when notifyOnBoardMention is enabled. Match is case-insensitive, @-prefix optional in this list.",
+        default: DEFAULT_CONFIG.boardUsernames,
+      },
+
+      // --- Inbox (non-reply text -> wake agent) ---
+      inboxAgentId: {
+        type: "string",
+        title: "Inbox agent ID",
+        description:
+          "Agent ID that receives plain-text messages sent to the default (or allow-listed) chat as new issues. Leave empty to disable. Board members type a message in Telegram and the selected agent wakes up with it.",
+        default: DEFAULT_CONFIG.inboxAgentId,
+      },
+      inboxChatIds: {
+        type: "array",
+        items: { type: "string" },
+        title: "Inbox chat allow-list",
+        description:
+          "Optional chat IDs allowed to send inbox messages. Empty = only defaultChatId is allowed.",
+        default: DEFAULT_CONFIG.inboxChatIds,
       },
 
       // --- Digest ---
@@ -250,7 +324,7 @@ const manifest: PaperclipPluginManifestV1 = {
         default: DEFAULT_CONFIG.watchDeduplicationWindowMs,
       },
     },
-    required: ["telegramBotTokenRef"],
+    required: [],
   },
   jobs: [
     {

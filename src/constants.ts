@@ -1,8 +1,9 @@
-export const PLUGIN_ID = "paperclip-plugin-telegram";
-export const PLUGIN_VERSION = "0.3.0";
+export const PLUGIN_ID = "paperclip-plugin-telegram-twb";
+export const PLUGIN_VERSION = "0.4.0";
 
 export const DEFAULT_CONFIG = {
   telegramBotTokenRef: "",
+  telegramBotToken: "",
   defaultChatId: "",
   approvalsChatId: "",
   errorsChatId: "",
@@ -10,10 +11,21 @@ export const DEFAULT_CONFIG = {
   paperclipPublicUrl: "",
   boardApiToken: "",
   boardApiTokenRef: "",
+  // Inbound board-API token. Required for inbound commands + inbox-wake on host
+  // builds that don't propagate an invocation scope into the poll loop (gated
+  // SDK host RPCs throw "unknown invocation scope"). See host-api.ts.
+  defaultCompanyId: "",
   notifyOnIssueCreated: true,
   notifyOnIssueDone: true,
   notifyOnApprovalCreated: true,
   notifyOnAgentError: true,
+  notifyOnAgentRunStarted: false,
+  notifyOnAgentRunFinished: false,
+  notifyOnIssueBlocked: true,
+  notifyOnBoardMention: true,
+  inboxAgentId: "",
+  inboxChatIds: [] as string[],
+  boardUsernames: [] as string[],
   enableCommands: true,
   enableInbound: true,
   digestMode: "off" as "off" | "daily" | "bidaily" | "tridaily",

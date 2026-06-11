@@ -190,12 +190,15 @@ describe("formatInteractionCreated", () => {
       },
     }));
     expect(msg.text).toContain("Approve this rollout");
+    expect(msg.text).toContain("Decision needed");
+    expect(msg.text).not.toContain("Kind:");
+    expect(msg.text).not.toContain("Interaction ID");
     const buttons = msg.options.inlineKeyboard![0];
     expect(buttons[0].callback_data).toBe("interaction_accept");
     expect(buttons[1].callback_data).toBe("interaction_reject");
   });
 
-  it("renders ask_user_questions instructions", () => {
+  it("renders ask_user_questions without exposing raw IDs", () => {
     const msg = formatInteractionCreated(mockEvent({
       interactionId: "int-2",
       interactionKind: "ask_user_questions",
@@ -216,8 +219,48 @@ describe("formatInteractionCreated", () => {
         },
       },
     }));
-    expect(msg.text).toContain("scope");
-    expect(msg.text).toContain("Reply format");
+    expect(msg.text).toContain("Q1");
+    expect(msg.text).toContain("Phase 0 only");
+    expect(msg.text).toContain("All phases");
+    expect(msg.text).not.toContain("scope =");
+    expect(msg.text).not.toContain("p0");
+    expect(msg.text).not.toContain("• all =");
+    expect(msg.text).not.toContain("Reply format");
+    expect(msg.text).toContain("Reply with option labels");
+  });
+
+  it("renders details in a dedicated block with paragraph breaks", () => {
+    const msg = formatInteractionCreated(mockEvent({
+      interactionId: "int-3",
+      interactionKind: "request_confirmation",
+      issueIdentifier: "TWX-138",
+      issueTitle: "Domain deploy check",
+      interaction: {
+        payload: {
+          prompt: "Approve Fix A?",
+          detailsMarkdown: "B1 ships regardless.\n\nFix A lowers TTL blast radius.",
+        },
+      },
+    }));
+    expect(msg.text).toContain("Details");
+    expect(msg.text).toContain("B1 ships regardless");
+    expect(msg.text).toContain("\n\nFix A lowers TTL blast radius");
+  });
+
+  it("renders issue references in details as friendly labels", () => {
+    const msg = formatInteractionCreated(mockEvent({
+      interactionId: "int-4",
+      interactionKind: "request_confirmation",
+      interaction: {
+        payload: {
+          prompt: "Approve Fix A?",
+          detailsMarkdown: "Context: /issues/TWX-91 and TWB-138 are related.",
+        },
+      },
+    }));
+    expect(msg.text).toContain("*TWX\\-91*");
+    expect(msg.text).toContain("*TWB\\-138*");
+    expect(msg.text).not.toContain("/issues/TWX\\-91");
   });
 });
 
