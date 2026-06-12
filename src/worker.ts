@@ -98,6 +98,12 @@ type TelegramConfig = {
   // Phase 5: Proactive Suggestions
   maxSuggestionsPerHourPerCompany: number;
   watchDeduplicationWindowMs: number;
+  // User-scoped decision routing (TWX-517/TWX-525)
+  // Maps Paperclip userId → Telegram chatId for targeted decision delivery.
+  userChatMappings?: Record<string, string>;
+  // Maps Telegram username or numeric user ID (as string) → Paperclip userId.
+  // Used to validate inbound callbacks and replies against the decision owner.
+  telegramActorMappings?: Record<string, string>;
 };
 
 const INTERACTION_DELIVERIES_NAMESPACE = "plugin_telegram_63f79ea5a3";
@@ -153,6 +159,9 @@ export type StoredMessageMapping = {
     selectionMode: "single" | "multi";
     options: Array<{ id: string; label: string }>;
   }>;
+  // User-scoped ownership: the Paperclip userId who owns this decision (TWX-525).
+  // Present only when routed via userChatMappings; null/absent for legacy/broadcast.
+  ownerUserId?: string;
 };
 
 function toRecord(value: unknown): Record<string, unknown> {
@@ -165,6 +174,28 @@ function firstNonEmptyString(source: Record<string, unknown>, keys: string[]): s
     if (typeof value === "string" && value.trim().length > 0) return value.trim();
   }
   return null;
+}
+
+// Resolve the Telegram chatId for a Paperclip userId from plugin config.
+function resolveUserChatId(
+  userChatMappings: Record<string, string> | undefined,
+  userId: string,
+): string | null {
+  if (!userId || !userChatMappings) return null;
+  return userChatMappings[userId] ?? null;
+}
+
+// Resolve the Paperclip userId for a Telegram actor (username or numeric id).
+// Looks up username first, then falls back to numeric ID string.
+export function resolveActorUserId(
+  telegramActorMappings: Record<string, string> | undefined,
+  username: string | undefined,
+  numericId: number,
+): string | null {
+  if (!telegramActorMappings) return null;
+  if (username && telegramActorMappings[username]) return telegramActorMappings[username]!;
+  const numStr = String(numericId);
+  return telegramActorMappings[numStr] ?? null;
 }
 
 function formatInboundAuditPrefix(msg: NonNullable<TelegramUpdate["message"]>): string {
@@ -542,6 +573,8 @@ export async function dispatchInteractionNotification(
     boardApiToken: string;
     defaultChatId: string;
     approvalsChatId?: string;
+    // User-scoped routing: maps Paperclip userId → Telegram chatId (TWX-525).
+    userChatMappings?: Record<string, string>;
     notify: InteractionNotify;
   },
 ): Promise<"sent" | "duplicate" | "skipped" | "failed"> {
@@ -611,10 +644,44 @@ export async function dispatchInteractionNotification(
           .filter((entry): entry is { id: string; selectionMode: "single" | "multi"; options: Array<{ id: string; label: string }> } => Boolean(entry))
       : [];
 
+    // User-scoped routing (TWX-525): prefer the interaction's targetUserId (added
+    // by TWX-517) to route decisions directly to the owner's chat. Fall back to the
+    // legacy approvalsChatId / defaultChatId for backward compatibility.
+    const targetUserId = firstNonEmptyString(payload, ["targetUserId"]) ?? null;
+    let targetChatId: string | null = null;
+    let ownerUserId: string | null = null;
+
+    if (targetUserId) {
+      targetChatId = resolveUserChatId(input.userChatMappings, targetUserId);
+      if (targetChatId) {
+        ownerUserId = targetUserId;
+      } else {
+        // Owner is known but has no Telegram mapping: send a non-actionable
+        // setup notice to the admin/default chat so someone can configure it.
+        ctx.logger.warn("Interaction owner has no Telegram chat mapping; sending setup notice", {
+          issueId,
+          interactionId,
+          targetUserId,
+        });
+        const noticeChatId = input.approvalsChatId || input.defaultChatId;
+        await input.notify(
+          event,
+          (e, opts) => ({
+            text: `⚠️ Decision needed for ${issue?.identifier ?? issueId} but owner \`${targetUserId}\` has no Telegram chat configured\\. Please configure \`userChatMappings\` and retry via the Paperclip board\\.`,
+            options: { parseMode: "MarkdownV2" as const },
+          }),
+          noticeChatId,
+        );
+        // Still mark as sent (the notice counts as delivery for idempotency).
+        await recordInteractionDeliverySent(ctx, event.companyId, issueId, interactionId, 0);
+        return "sent";
+      }
+    }
+
     const messageId = await input.notify(
       event,
       formatInteractionCreated,
-      input.approvalsChatId || input.defaultChatId,
+      targetChatId ?? input.approvalsChatId ?? input.defaultChatId,
       {
         entityType: "interaction",
         issueId,
@@ -622,6 +689,7 @@ export async function dispatchInteractionNotification(
         interactionId,
         interactionKind,
         interactionQuestions: questions,
+        ownerUserId: ownerUserId ?? undefined,
       },
     );
 
@@ -1003,6 +1071,7 @@ const plugin = definePlugin({
         boardApiToken,
         defaultChatId: config.defaultChatId,
         approvalsChatId: config.approvalsChatId,
+        userChatMappings: config.userChatMappings,
         notify,
       });
     });
@@ -1452,7 +1521,7 @@ export async function handleUpdate(
   boardApiToken: string = "",
 ): Promise<void> {
   if (update.callback_query) {
-    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken);
+    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, config.telegramActorMappings);
     return;
   }
 
@@ -1664,6 +1733,30 @@ export async function handleUpdate(
         });
       }
     } else if (mapping && mapping.entityType === "interaction" && mapping.issueId && mapping.interactionId) {
+      // User-scoped ownership guard (TWX-525): reject native replies from actors
+      // who are not the intended decision owner before making any API call.
+      if (mapping.ownerUserId) {
+        const actorUserId = resolveActorUserId(
+          config.telegramActorMappings,
+          msg.from?.username,
+          msg.from?.id ?? 0,
+        );
+        if (actorUserId !== mapping.ownerUserId) {
+          ctx.logger.info("Rejected cross-user interaction reply", {
+            ownerUserId: mapping.ownerUserId,
+            actorUserId,
+            interactionId: mapping.interactionId,
+          });
+          await sendMessage(
+            ctx,
+            token,
+            chatId,
+            escapeMarkdownV2("This decision is not yours to answer."),
+            { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+          );
+          return;
+        }
+      }
       const result = await routeInteractionResponse(ctx, baseUrl, boardApiToken, mapping, text);
       switch (result) {
         case "routed":
@@ -1771,6 +1864,7 @@ export async function handleCallbackQuery(
   query: NonNullable<TelegramUpdate["callback_query"]>,
   baseUrl: string,
   boardApiToken: string = "",
+  telegramActorMappings?: Record<string, string>,
 ): Promise<void> {
   const data = query.data;
   if (!data) return;
@@ -1828,6 +1922,24 @@ export async function handleCallbackQuery(
     if (!mapping?.issueId || !mapping.interactionId) {
       await answerCallbackQuery(ctx, token, query.id, "Interaction mapping missing");
       return;
+    }
+
+    // User-scoped ownership guard (TWX-525): reject callbacks from actors who are
+    // not the intended decision owner. Server-side 403 remains the hard stop; this
+    // is an early local rejection that avoids an unnecessary round-trip and gives a
+    // clear message to the unintended actor.
+    if (mapping.ownerUserId) {
+      const actorUserId = resolveActorUserId(telegramActorMappings, query.from.username, query.from.id);
+      if (actorUserId !== mapping.ownerUserId) {
+        ctx.logger.info("Rejected cross-user interaction callback", {
+          ownerUserId: mapping.ownerUserId,
+          actorUserId,
+          actor,
+          interactionId: mapping.interactionId,
+        });
+        await answerCallbackQuery(ctx, token, query.id, "Not your decision");
+        return;
+      }
     }
 
     try {
