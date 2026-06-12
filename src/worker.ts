@@ -102,7 +102,7 @@ type TelegramConfig = {
 
 const INTERACTION_DELIVERIES_NAMESPACE = "plugin_telegram_63f79ea5a3";
 
-type TelegramUpdate = {
+export type TelegramUpdate = {
   update_id: number;
   message?: {
     message_id: number;
@@ -138,7 +138,7 @@ type TelegramUpdate = {
 
 const TELEGRAM_API = "https://api.telegram.org";
 
-type StoredMessageMapping = {
+export type StoredMessageMapping = {
   entityId: string;
   entityType: string;
   companyId: string;
