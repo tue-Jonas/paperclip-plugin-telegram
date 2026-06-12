@@ -182,37 +182,122 @@ function buildInboundAuditComment(
   return `${formatInboundAuditPrefix(msg)}\n\n${body}`;
 }
 
-function parseAskQuestionsAnswers(
+type ParsedQuestion = NonNullable<StoredMessageMapping["interactionQuestions"]>[number];
+
+// Hint shown to users on a failed parse — keep it aligned with the Telegram
+// formatter contract (formatters.ts:formatInteractionCreated, ask_user_questions).
+export const ASK_QUESTIONS_PARSE_HINT =
+  'No valid answers parsed. Reply with the option label (e.g. "Approve"). For multiple questions: Q1: <option label>';
+
+// Resolve a single token (an option label OR an option id) to its option id for
+// the given question. Label matching is case-insensitive and whitespace-trimmed.
+function matchOptionId(question: ParsedQuestion, token: string): string | null {
+  const needle = token.trim();
+  if (!needle) return null;
+  for (const option of question.options) {
+    if (option.id === needle) return option.id;
+  }
+  const lowered = needle.toLowerCase();
+  for (const option of question.options) {
+    if (option.label.trim().toLowerCase() === lowered) return option.id;
+  }
+  return null;
+}
+
+// Resolve the value part of a reply (e.g. "High priority, Bug") to option ids.
+// Comma-separated tokens are matched individually; if none match, the whole value
+// is tried as a single option (so labels containing commas still resolve).
+function resolveOptionIds(question: ParsedQuestion, valuePart: string): string[] {
+  const matched: string[] = [];
+  for (const raw of valuePart.split(",")) {
+    const id = matchOptionId(question, raw);
+    if (id) matched.push(id);
+  }
+  if (matched.length === 0) {
+    const whole = matchOptionId(question, valuePart);
+    if (whole) matched.push(whole);
+  }
+  return matched;
+}
+
+/**
+ * Parse an inbound Telegram reply to an `ask_user_questions` interaction into the
+ * `{ questionId, optionIds }[]` shape the board API expects.
+ *
+ * Accepted human-visible formats (matching the formatter contract):
+ *  - Single question, bare label(s):           `High priority`  /  `Bug, Feature`
+ *  - Multiple questions, positional addressing: `Q1: High priority` / `Q2: Bug, Feature`
+ *  - Legacy id syntax (backward compatible):    `q-priority=opt-high,opt-low`
+ *
+ * Option tokens match either an option label (case-insensitive) or an option id.
+ * For single-select questions only the first matched option is kept; for
+ * multi-select, matches are de-duplicated. Lines that can't be attributed to a
+ * question (e.g. a bare label while several questions are pending) are skipped.
+ */
+export function parseAskQuestionsAnswers(
   text: string,
   questions: StoredMessageMapping["interactionQuestions"],
 ): Array<{ questionId: string; optionIds: string[] }> {
   const availableQuestions = Array.isArray(questions) ? questions : [];
-  const answers: Array<{ questionId: string; optionIds: string[] }> = [];
-  const byQuestionId = new Map<string, { id: string; selectionMode: "single" | "multi"; options: Set<string> }>();
-  for (const question of availableQuestions) {
-    byQuestionId.set(question.id, {
-      id: question.id,
-      selectionMode: question.selectionMode,
-      options: new Set(question.options.map((option) => option.id)),
-    });
-  }
+  if (availableQuestions.length === 0) return [];
+
+  const byId = new Map<string, ParsedQuestion>();
+  for (const question of availableQuestions) byId.set(question.id, question);
+
+  // Accumulate per question so repeated/merged lines de-dup cleanly.
+  const accumulator = new Map<string, { question: ParsedQuestion; optionIds: string[] }>();
+  const record = (question: ParsedQuestion, optionIds: string[]) => {
+    if (optionIds.length === 0) return;
+    const existing = accumulator.get(question.id) ?? { question, optionIds: [] };
+    for (const id of optionIds) {
+      if (!existing.optionIds.includes(id)) existing.optionIds.push(id);
+    }
+    accumulator.set(question.id, existing);
+  };
 
   const lines = text.split("\n").map((line) => line.trim()).filter((line) => line.length > 0);
   for (const line of lines) {
-    const parts = line.split("=");
-    if (parts.length !== 2) continue;
-    const questionId = parts[0]?.trim() ?? "";
-    const optionPart = parts[1]?.trim() ?? "";
-    if (!questionId || !optionPart) continue;
-    const question = byQuestionId.get(questionId);
-    if (!question) continue;
-    const optionIds = optionPart
-      .split(",")
-      .map((entry) => entry.trim())
-      .filter((entry) => entry.length > 0 && question.options.has(entry));
-    if (optionIds.length === 0) continue;
-    const normalized = question.selectionMode === "single" ? [optionIds[0]!] : Array.from(new Set(optionIds));
-    answers.push({ questionId, optionIds: normalized });
+    // Split on the first ':' or '=' delimiter into head/value.
+    const delimiterMatch = line.match(/[:=]/);
+    if (delimiterMatch && delimiterMatch.index !== undefined) {
+      const head = line.slice(0, delimiterMatch.index).trim();
+      const value = line.slice(delimiterMatch.index + 1).trim();
+      if (!value) continue;
+
+      // Legacy id syntax: head is an exact question id.
+      const byIdQuestion = byId.get(head);
+      if (byIdQuestion) {
+        record(byIdQuestion, resolveOptionIds(byIdQuestion, value));
+        continue;
+      }
+      // Positional addressing: head is `Q<n>` (1-indexed, as shown in the message).
+      const positional = head.match(/^Q(\d+)$/i);
+      if (positional) {
+        const index = Number.parseInt(positional[1]!, 10) - 1;
+        const question = availableQuestions[index];
+        if (question) record(question, resolveOptionIds(question, value));
+        continue;
+      }
+      // Unrecognized head: only safe to attribute if there's a single question.
+      if (availableQuestions.length === 1) {
+        record(availableQuestions[0]!, resolveOptionIds(availableQuestions[0]!, line));
+      }
+      continue;
+    }
+
+    // No delimiter: a bare label only resolves when exactly one question pending.
+    if (availableQuestions.length === 1) {
+      record(availableQuestions[0]!, resolveOptionIds(availableQuestions[0]!, line));
+    }
+  }
+
+  const answers: Array<{ questionId: string; optionIds: string[] }> = [];
+  for (const question of availableQuestions) {
+    const entry = accumulator.get(question.id);
+    if (!entry || entry.optionIds.length === 0) continue;
+    const optionIds =
+      question.selectionMode === "single" ? [entry.optionIds[0]!] : entry.optionIds;
+    answers.push({ questionId: question.id, optionIds });
   }
 
   return answers;
@@ -1609,7 +1694,7 @@ export async function handleUpdate(
             ctx,
             token,
             chatId,
-            escapeMarkdownV2("No valid answers parsed. Use: question_id=option_id[,option_id]"),
+            escapeMarkdownV2(ASK_QUESTIONS_PARSE_HINT),
             { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
           );
           break;
