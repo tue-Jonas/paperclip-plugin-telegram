@@ -4,9 +4,14 @@ import {
   dispatchInteractionNotification,
   handleCallbackQuery,
   handleUpdate,
-  resolveActorUserId,
 } from "../src/worker.js";
-import { __resetHostApiState, setUserChatMapping } from "../src/host-api.js";
+import {
+  __resetHostApiState,
+  configuredActorMappings,
+  configuredUserChatMappings,
+  resolveActorUserId,
+  setUserChatMapping,
+} from "../src/host-api.js";
 
 // TWX-525: User-scoped decision routing.
 // - Jonas-owned interaction cards are routed to Jonas's chat only.
@@ -153,8 +158,23 @@ function makeNotify(notifiedChats: string[]) {
 // ────────────────────────────────────────────────────────────────────────────
 
 describe("resolveActorUserId", () => {
+  it("falls back to legacy mapping keys when new mapping objects are empty", () => {
+    expect(configuredActorMappings({
+      telegramActorMappings: {},
+      boardUserAliases: TELEGRAM_ACTOR_MAPPINGS,
+    })).toBe(TELEGRAM_ACTOR_MAPPINGS);
+    expect(configuredUserChatMappings({
+      userChatMappings: {},
+      boardUserChatIds: USER_CHAT_MAPPINGS,
+    })).toBe(USER_CHAT_MAPPINGS);
+  });
+
   it("resolves by Telegram username", () => {
     expect(resolveActorUserId(TELEGRAM_ACTOR_MAPPINGS, "tue_jonas", 0)).toBe(JONAS_USER_ID);
+  });
+
+  it("resolves Telegram usernames case-insensitively", () => {
+    expect(resolveActorUserId(TELEGRAM_ACTOR_MAPPINGS, "TUE_JONAS", 0)).toBe(JONAS_USER_ID);
   });
 
   it("resolves by numeric Telegram user ID when username is absent", () => {

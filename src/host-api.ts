@@ -104,17 +104,26 @@ export function resolveActorUserId(
   numericId: number,
 ): string | null {
   if (!telegramActorMappings) return null;
-  if (username && telegramActorMappings[username]) return telegramActorMappings[username]!;
+  const usernameKey = username?.trim();
+  if (usernameKey && telegramActorMappings[usernameKey]) return telegramActorMappings[usernameKey]!;
+  const lowercaseUsernameKey = usernameKey?.toLowerCase();
+  if (lowercaseUsernameKey && telegramActorMappings[lowercaseUsernameKey]) {
+    return telegramActorMappings[lowercaseUsernameKey]!;
+  }
   const numStr = String(numericId);
   return telegramActorMappings[numStr] ?? null;
 }
 
+function nonEmptyRecord(record: Record<string, string> | undefined): Record<string, string> | undefined {
+  return record && Object.keys(record).length > 0 ? record : undefined;
+}
+
 export function configuredUserChatMappings(config: HostApiConfig): Record<string, string> | undefined {
-  return config.userChatMappings ?? config.boardUserChatIds;
+  return nonEmptyRecord(config.userChatMappings) ?? nonEmptyRecord(config.boardUserChatIds);
 }
 
 export function configuredActorMappings(config: HostApiConfig): Record<string, string> | undefined {
-  return config.telegramActorMappings ?? config.boardUserAliases;
+  return nonEmptyRecord(config.telegramActorMappings) ?? nonEmptyRecord(config.boardUserAliases);
 }
 
 export function setUserChatMapping(companyId: string, userId: string, chatId: string): void {

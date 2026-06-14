@@ -344,10 +344,9 @@ async function handleConnect(
     const actorUserId = actor
       ? resolveActorUserId(configuredActorMappings(config), actor.username, actor.id)
       : null;
-    let userChatMappingResult: "persisted" | "memory_only" | "unmapped" = "unmapped";
-    if (actorUserId) {
-      userChatMappingResult = await persistUserChatMapping(ctx, match.id, actorUserId, chatId);
-    }
+    const userChatMappingResult = actorUserId
+      ? await persistUserChatMapping(ctx, match.id, actorUserId, chatId)
+      : "unmapped";
 
     // Best-effort durable writes: these will succeed once the host propagates
     // an invocation scope into the poll loop (Option 1 / fork-core fix). Until
@@ -363,13 +362,21 @@ async function handleConnect(
       );
     } catch { /* best effort — gated until host scope fix lands */ }
 
-    await sendMessage(
-      ctx,
-      token,
-      chatId,
+    const responseLines = [
       `${escapeMarkdownV2("🔗")} ${escapeMarkdownV2("Linked this chat to company:")} *${escapeMarkdownV2(match.name ?? input)}*`,
-      { parseMode: "MarkdownV2", messageThreadId },
-    );
+    ];
+    if (userChatMappingResult === "persisted") {
+      responseLines.push(escapeMarkdownV2("Decision cards for your Paperclip user will route to this chat."));
+    } else if (userChatMappingResult === "memory_only") {
+      responseLines.push(escapeMarkdownV2("Decision cards are linked until the bot restarts. Re-run /connect after a restart if decision cards stop arriving."));
+    } else if (actor) {
+      responseLines.push(escapeMarkdownV2("Decision-card routing was not linked because this Telegram user is not mapped to a Paperclip user."));
+    }
+
+    await sendMessage(ctx, token, chatId, responseLines.join("\n"), {
+      parseMode: "MarkdownV2",
+      messageThreadId,
+    });
 
     ctx.logger.info("Chat linked to company", {
       chatId,

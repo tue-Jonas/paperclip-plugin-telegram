@@ -51,9 +51,9 @@ import {
   createIssue,
   updateIssue,
   resolveUserChatId as resolveMappedUserChatId,
-  resolveActorUserId,
   configuredActorMappings,
   configuredUserChatMappings,
+  resolveActorUserId,
 } from "./host-api.js";
 import { fetchApprovalContext, submitApprovalDecision } from "./approvals-api.js";
 import {
@@ -113,8 +113,6 @@ type TelegramConfig = {
 };
 
 const INTERACTION_DELIVERIES_NAMESPACE = "plugin_telegram_63f79ea5a3";
-
-export { resolveActorUserId };
 
 export type TelegramUpdate = {
   update_id: number;
