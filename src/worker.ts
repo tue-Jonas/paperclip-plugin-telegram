@@ -151,6 +151,7 @@ export type StoredMessageMapping = {
   eventType?: string;
   issueId?: string;
   issueIdentifier?: string;
+  issueTitle?: string;
   approvalId?: string;
   interactionId?: string;
   interactionKind?: string;
@@ -163,6 +164,19 @@ export type StoredMessageMapping = {
   // Present only when routed via userChatMappings; null/absent for legacy/broadcast.
   ownerUserId?: string;
 };
+
+type RecentChatContextEntry = {
+  messageId: number;
+  eventType: string;
+  entityType: string;
+  issueIdentifier: string;
+  issueTitle: string;
+  at: string;
+};
+
+const RECENT_CHAT_CONTEXT_KEY_PREFIX = "recent_ctx_";
+const RECENT_CHAT_CONTEXT_LIMIT = 10;
+const RECENT_CHAT_CONTEXT_DISPLAY_LIMIT = 5;
 
 function toRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {};
@@ -363,6 +377,171 @@ function resolveCompanyId(config: HostApiConfig, chatId: string): string {
   return resolveCompanyIdFromMap(chatId, config);
 }
 
+function recentChatContextKey(chatId: string): string {
+  return `${RECENT_CHAT_CONTEXT_KEY_PREFIX}${chatId}`;
+}
+
+function parseRecentChatContextEntries(value: unknown): RecentChatContextEntry[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((entry) => {
+    const record = toRecord(entry);
+    const issueIdentifier = firstNonEmptyString(record, ["issueIdentifier"]);
+    const issueTitle = firstNonEmptyString(record, ["issueTitle"]);
+    const eventType = firstNonEmptyString(record, ["eventType"]);
+    const entityType = firstNonEmptyString(record, ["entityType"]);
+    const at = firstNonEmptyString(record, ["at"]);
+    const messageIdRaw = record.messageId;
+    const messageId = typeof messageIdRaw === "number"
+      ? messageIdRaw
+      : typeof messageIdRaw === "string"
+        ? Number.parseInt(messageIdRaw, 10)
+        : NaN;
+    if (!issueIdentifier || !issueTitle || !eventType || !entityType || !at || !Number.isFinite(messageId)) {
+      return [];
+    }
+    return [{
+      messageId,
+      issueIdentifier,
+      issueTitle,
+      eventType,
+      entityType,
+      at,
+    }];
+  });
+}
+
+function buildRecentChatContextEntry(
+  event: PluginEvent,
+  messageId: number,
+  mappingOverride?: Partial<StoredMessageMapping>,
+): RecentChatContextEntry | null {
+  const payload = toRecord(event.payload);
+  const linkedIssues = Array.isArray(payload.linkedIssues)
+    ? payload.linkedIssues as Array<Record<string, unknown>>
+    : [];
+  const linkedIssue = linkedIssues[0] ? toRecord(linkedIssues[0]) : {};
+  const issueIdentifier = firstNonEmptyString(
+    {
+      ...payload,
+      ...linkedIssue,
+      issueIdentifier: mappingOverride?.issueIdentifier ?? payload.issueIdentifier,
+    },
+    ["issueIdentifier", "identifier"],
+  );
+  const issueTitle = firstNonEmptyString(
+    {
+      ...payload,
+      ...linkedIssue,
+      issueTitle: mappingOverride?.issueTitle ?? payload.issueTitle,
+    },
+    ["issueTitle", "title"],
+  );
+  if (!issueIdentifier || !issueTitle) return null;
+  return {
+    messageId,
+    eventType: String(event.eventType ?? "unknown"),
+    entityType: String(mappingOverride?.entityType ?? event.entityType ?? "unknown"),
+    issueIdentifier,
+    issueTitle,
+    at: new Date().toISOString(),
+  };
+}
+
+async function appendRecentChatContext(
+  ctx: PluginContext,
+  chatId: string,
+  entry: RecentChatContextEntry,
+): Promise<void> {
+  try {
+    const existing = parseRecentChatContextEntries(await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: recentChatContextKey(chatId),
+    }));
+    const next = [...existing, entry].slice(-RECENT_CHAT_CONTEXT_LIMIT);
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: recentChatContextKey(chatId) },
+      next,
+    );
+  } catch {
+    // best effort
+  }
+}
+
+async function readRecentChatContext(
+  ctx: PluginContext,
+  chatId: string,
+): Promise<RecentChatContextEntry[]> {
+  try {
+    return parseRecentChatContextEntries(await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: recentChatContextKey(chatId),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function formatChatContextTime(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  return new Intl.DateTimeFormat("en", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+    timeZone: "UTC",
+  }).format(date) + "Z";
+}
+
+function quoteMarkdown(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+}
+
+async function buildInboxReplyContext(
+  ctx: PluginContext,
+  chatId: string,
+  msg: NonNullable<TelegramUpdate["message"]>,
+): Promise<string[]> {
+  const reply = msg.reply_to_message;
+  if (!reply) return [];
+
+  const lines = [`Replying to Telegram message ${reply.message_id}:`];
+  if (reply.text?.trim()) {
+    lines.push(quoteMarkdown(reply.text.trim()));
+  }
+
+  try {
+    const mapping = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `msg_${chatId}_${reply.message_id}`,
+    }) as StoredMessageMapping | null;
+    if (mapping?.issueIdentifier) {
+      const linkedTitle = mapping.issueTitle ? ` "${mapping.issueTitle}"` : "";
+      const linkedEvent = mapping.eventType ? ` — ${mapping.eventType}` : "";
+      lines.push(`Linked notification: ${mapping.issueIdentifier}${linkedTitle}${linkedEvent}`);
+    }
+  } catch {
+    // best effort
+  }
+
+  return lines;
+}
+
+async function buildInboxRecentContext(
+  ctx: PluginContext,
+  chatId: string,
+): Promise<string[]> {
+  const entries = (await readRecentChatContext(ctx, chatId)).slice(-RECENT_CHAT_CONTEXT_DISPLAY_LIMIT);
+  if (entries.length === 0) return [];
+  return [
+    "Recent context in this chat:",
+    ...entries.map((entry) =>
+      `- ${entry.issueIdentifier} "${entry.issueTitle}" — ${entry.eventType} (${formatChatContextTime(entry.at)})`),
+  ];
+}
+
 function quoteIdentifier(value: string): string {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(value)) {
     throw new Error(`Unsafe SQL identifier: ${value}`);
@@ -558,6 +737,185 @@ export async function routeInteractionResponse(
   }
 }
 
+async function tryRouteInboundReply(
+  ctx: PluginContext,
+  token: string,
+  config: TelegramConfig,
+  msg: NonNullable<TelegramUpdate["message"]>,
+  chatId: string,
+  text: string,
+  baseUrl: string,
+  boardApiToken: string,
+): Promise<boolean> {
+  if (!config.enableInbound || !msg.reply_to_message?.from?.is_bot) return false;
+
+  const replyToId = msg.reply_to_message.message_id;
+  const inboundKey = `inbound_${chatId}_${msg.message_id}`;
+  let alreadyProcessed: unknown = null;
+  try {
+    alreadyProcessed = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: inboundKey,
+    });
+  } catch {
+    alreadyProcessed = null;
+  }
+  if (alreadyProcessed) return true;
+
+  const markInboundRouted = async () => {
+    try {
+      await ctx.state.set(
+        { scopeKind: "instance", stateKey: inboundKey },
+        { routedAt: new Date().toISOString() },
+      );
+    } catch {
+      // best effort
+    }
+  };
+
+  let mapping: StoredMessageMapping | null = null;
+  try {
+    mapping = await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: `msg_${chatId}_${replyToId}`,
+    }) as StoredMessageMapping | null;
+  } catch {
+    mapping = null;
+  }
+
+  if (!mapping) return false;
+
+  if (mapping.entityType === "escalation") {
+    const escalationManager = new EscalationManager();
+    const responderId = `telegram:${msg.from?.username ?? msg.from?.id ?? chatId}`;
+    await escalationManager.respond(ctx, token, mapping.entityId, {
+      escalationId: mapping.entityId,
+      responderId,
+      responseText: text,
+      action: "reply_to_customer",
+    });
+    await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+    ctx.logger.info("Routed Telegram reply to escalation", {
+      escalationId: mapping.entityId,
+      from: msg.from?.username,
+    });
+    await markInboundRouted();
+    return true;
+  }
+
+  if (mapping.entityType === "issue") {
+    try {
+      await ctx.issues.createComment(
+        mapping.entityId,
+        buildInboundAuditComment(msg, text),
+        mapping.companyId,
+      );
+      await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+      ctx.logger.info("Routed Telegram reply to issue comment", {
+        issueId: mapping.entityId,
+        from: msg.from?.username,
+      });
+      await markInboundRouted();
+    } catch (err) {
+      ctx.logger.error("Failed to route inbound message", {
+        issueId: mapping.entityId,
+        error: String(err),
+      });
+    }
+    return true;
+  }
+
+  if (mapping.entityType === "approval" && mapping.issueId) {
+    try {
+      await ctx.issues.createComment(
+        mapping.issueId,
+        buildInboundAuditComment(msg, text),
+        mapping.companyId,
+      );
+      await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+      ctx.logger.info("Routed Telegram reply to approval-linked issue comment", {
+        approvalId: mapping.approvalId ?? mapping.entityId,
+        issueId: mapping.issueId,
+        from: msg.from?.username,
+      });
+      await markInboundRouted();
+    } catch (err) {
+      ctx.logger.error("Failed to route approval reply to issue comment", {
+        approvalId: mapping.approvalId ?? mapping.entityId,
+        issueId: mapping.issueId,
+        error: String(err),
+      });
+    }
+    return true;
+  }
+
+  if (mapping.entityType === "interaction" && mapping.issueId && mapping.interactionId) {
+    if (mapping.ownerUserId) {
+      const actorUserId = resolveActorUserId(
+        config.telegramActorMappings,
+        msg.from?.username,
+        msg.from?.id ?? 0,
+      );
+      if (actorUserId !== mapping.ownerUserId) {
+        ctx.logger.info("Rejected cross-user interaction reply", {
+          ownerUserId: mapping.ownerUserId,
+          actorUserId,
+          interactionId: mapping.interactionId,
+        });
+        await sendMessage(
+          ctx,
+          token,
+          chatId,
+          escapeMarkdownV2("This decision is not yours to answer."),
+          { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+        );
+        return true;
+      }
+    }
+
+    const result = await routeInteractionResponse(ctx, baseUrl, boardApiToken, mapping, text);
+    switch (result) {
+      case "routed":
+        await clearPendingDecision(ctx, chatId);
+        await markInboundRouted();
+        break;
+      case "already-resolved":
+        await clearPendingDecision(ctx, chatId);
+        await sendMessage(
+          ctx,
+          token,
+          chatId,
+          escapeMarkdownV2("This decision was already resolved."),
+          { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+        );
+        break;
+      case "missing-token":
+        await sendMessage(
+          ctx,
+          token,
+          chatId,
+          escapeMarkdownV2("Cannot route interaction reply: board token is missing."),
+          { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+        );
+        break;
+      case "needs-input":
+        await sendMessage(
+          ctx,
+          token,
+          chatId,
+          escapeMarkdownV2(ASK_QUESTIONS_PARSE_HINT),
+          { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+        );
+        break;
+      default:
+        break;
+    }
+    return true;
+  }
+
+  return true;
+}
+
 type InteractionNotify = (
   event: PluginEvent,
   formatter: (e: PluginEvent, opts?: IssueLinksOpts) => { text: string; options: import("./telegram-api.js").SendMessageOptions },
@@ -686,6 +1044,7 @@ export async function dispatchInteractionNotification(
         entityType: "interaction",
         issueId,
         issueIdentifier: issue?.identifier ?? issueId,
+        issueTitle: issue?.title ?? undefined,
         interactionId,
         interactionKind,
         interactionQuestions: questions,
@@ -911,6 +1270,11 @@ const plugin = definePlugin({
             mapping,
           );
         } catch { /* best effort */ }
+
+        const recentContext = buildRecentChatContextEntry(event, messageId, mappingOverride);
+        if (recentContext) {
+          await appendRecentChatContext(ctx, chatId, recentContext);
+        }
 
         // TWX-455: remember the pending decision for this chat so a free-text
         // (non-native-reply) response routes back to the decision instead of
@@ -1623,180 +1987,24 @@ export async function handleUpdate(
   }
 
   // --- Inbox wake: plain text from the board → new issue for the configured agent ---
-  // Fires only for top-level (non-thread, non-reply, non-command) text messages
-  // in an allow-listed chat. Creates an issue assigned to inboxAgentId so the
-  // agent wakes via the standard assignment path.
+  // First let real bot-replies route through the existing inbound mapping path.
+  // If there is no matching mapping, the reply may still become a fresh inbox
+  // issue with quoted context below.
+  if (await tryRouteInboundReply(ctx, token, config, msg, chatId, text, baseUrl, boardApiToken)) {
+    return;
+  }
+
+  // Fires for top-level (non-thread, non-command) text messages in an
+  // allow-listed chat, including replies that did not match a decision / inbound
+  // mapping. Creates an issue assigned to inboxAgentId so the agent wakes via
+  // the standard assignment path.
   const isInboxEligible =
     !!config.inboxAgentId &&
     !threadId &&
-    !isReply &&
     isInboxChatAllowed(chatId, config.defaultChatId ?? "", config.inboxChatIds ?? []);
   if (isInboxEligible) {
     await handleInboxWake(ctx, token, config, msg, chatId, text);
     return;
-  }
-
-  if (config.enableInbound && msg.reply_to_message?.from?.is_bot) {
-    const replyToId = msg.reply_to_message.message_id;
-    const inboundKey = `inbound_${chatId}_${msg.message_id}`;
-    // Dedup state reads are best-effort under host-gated runtimes. If this
-    // throws, treat it as "not processed yet" so inbound routing still runs.
-    let alreadyProcessed: unknown = null;
-    try {
-      alreadyProcessed = await ctx.state.get({
-        scopeKind: "instance",
-        stateKey: inboundKey,
-      });
-    } catch {
-      alreadyProcessed = null;
-    }
-    if (alreadyProcessed) return;
-
-    const markInboundRouted = async () => {
-      try {
-        await ctx.state.set(
-          { scopeKind: "instance", stateKey: inboundKey },
-          { routedAt: new Date().toISOString() },
-        );
-      } catch {
-        // best effort
-      }
-    };
-
-    // The msg→entity map is written by notify() via ctx.state.set, which is
-    // gated in event handlers under the invocation-scope bug — so this lookup
-    // may throw or be empty. Degrade to "no mapping" instead of crashing the
-    // poll loop.
-    let mapping: StoredMessageMapping | null = null;
-    try {
-      mapping = await ctx.state.get({
-        scopeKind: "instance",
-        stateKey: `msg_${chatId}_${replyToId}`,
-      }) as StoredMessageMapping | null;
-    } catch {
-      mapping = null;
-    }
-
-    if (mapping && mapping.entityType === "escalation") {
-      const escalationManager = new EscalationManager();
-      const responderId = `telegram:${msg.from?.username ?? msg.from?.id ?? chatId}`;
-      await escalationManager.respond(ctx, token, mapping.entityId, {
-        escalationId: mapping.entityId,
-        responderId,
-        responseText: text,
-        action: "reply_to_customer",
-      });
-      await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-      ctx.logger.info("Routed Telegram reply to escalation", {
-        escalationId: mapping.entityId,
-        from: msg.from?.username,
-      });
-      await markInboundRouted();
-    } else if (mapping && mapping.entityType === "issue") {
-      try {
-        await ctx.issues.createComment(
-          mapping.entityId,
-          buildInboundAuditComment(msg, text),
-          mapping.companyId,
-        );
-        await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-        ctx.logger.info("Routed Telegram reply to issue comment", {
-          issueId: mapping.entityId,
-          from: msg.from?.username,
-        });
-        await markInboundRouted();
-      } catch (err) {
-        ctx.logger.error("Failed to route inbound message", {
-          issueId: mapping.entityId,
-          error: String(err),
-        });
-      }
-    } else if (mapping && mapping.entityType === "approval" && mapping.issueId) {
-      try {
-        await ctx.issues.createComment(
-          mapping.issueId,
-          buildInboundAuditComment(msg, text),
-          mapping.companyId,
-        );
-        await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
-        ctx.logger.info("Routed Telegram reply to approval-linked issue comment", {
-          approvalId: mapping.approvalId ?? mapping.entityId,
-          issueId: mapping.issueId,
-          from: msg.from?.username,
-        });
-        await markInboundRouted();
-      } catch (err) {
-        ctx.logger.error("Failed to route approval reply to issue comment", {
-          approvalId: mapping.approvalId ?? mapping.entityId,
-          issueId: mapping.issueId,
-          error: String(err),
-        });
-      }
-    } else if (mapping && mapping.entityType === "interaction" && mapping.issueId && mapping.interactionId) {
-      // User-scoped ownership guard (TWX-525): reject native replies from actors
-      // who are not the intended decision owner before making any API call.
-      if (mapping.ownerUserId) {
-        const actorUserId = resolveActorUserId(
-          config.telegramActorMappings,
-          msg.from?.username,
-          msg.from?.id ?? 0,
-        );
-        if (actorUserId !== mapping.ownerUserId) {
-          ctx.logger.info("Rejected cross-user interaction reply", {
-            ownerUserId: mapping.ownerUserId,
-            actorUserId,
-            interactionId: mapping.interactionId,
-          });
-          await sendMessage(
-            ctx,
-            token,
-            chatId,
-            escapeMarkdownV2("This decision is not yours to answer."),
-            { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
-          );
-          return;
-        }
-      }
-      const result = await routeInteractionResponse(ctx, baseUrl, boardApiToken, mapping, text);
-      switch (result) {
-        case "routed":
-          await clearPendingDecision(ctx, chatId);
-          await markInboundRouted();
-          break;
-        case "already-resolved":
-          await clearPendingDecision(ctx, chatId);
-          await sendMessage(
-            ctx,
-            token,
-            chatId,
-            escapeMarkdownV2("This decision was already resolved."),
-            { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
-          );
-          break;
-        case "missing-token":
-          await sendMessage(
-            ctx,
-            token,
-            chatId,
-            escapeMarkdownV2("Cannot route interaction reply: board token is missing."),
-            { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
-          );
-          break;
-        case "needs-input":
-          await sendMessage(
-            ctx,
-            token,
-            chatId,
-            escapeMarkdownV2(ASK_QUESTIONS_PARSE_HINT),
-            { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
-          );
-          break;
-        default:
-          // "error" already logged inside routeInteractionResponse; "skipped"
-          // means nothing to do.
-          break;
-      }
-    }
   }
 }
 
@@ -1824,11 +2032,19 @@ export async function handleInboxWake(
     : msg.from?.first_name ?? "Telegram user";
   const shortBody = text.length > 140 ? text.slice(0, 137).trimEnd() + "…" : text;
   const issueTitle = `[Inbox] ${shortBody.replace(/\s+/g, " ")}`;
-  const issueDescription = [
+  const replyContext = await buildInboxReplyContext(ctx, chatId, msg);
+  const recentContext = await buildInboxRecentContext(ctx, chatId);
+  const descriptionParts = [
     `From ${sender} via Telegram (chat ${chatId}, message ${msg.message_id}).`,
-    "",
-    text,
-  ].join("\n");
+  ];
+  if (replyContext.length > 0) {
+    descriptionParts.push("", ...replyContext);
+  }
+  if (recentContext.length > 0) {
+    descriptionParts.push("", ...recentContext);
+  }
+  descriptionParts.push("", text);
+  const issueDescription = descriptionParts.join("\n");
   try {
     const created = await createIssue(ctx, config as HostApiConfig, companyId, {
       title: issueTitle.length > 200 ? issueTitle.slice(0, 197) + "…" : issueTitle,
