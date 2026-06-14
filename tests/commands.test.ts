@@ -4,6 +4,7 @@ import {
   __resetHostApiState,
   resolveCompanyId,
   getChatCompanyName,
+  getUserChatMapping,
 } from "../src/host-api.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 
@@ -18,6 +19,7 @@ const CONFIG = {
   defaultCompanyId: "co-1",
   paperclipBaseUrl: "http://localhost:3100",
 };
+const JONAS_USER_ID = "U1v5HFLADePyPLXPTX17rsUiCWkG40zl";
 
 let sentMessages: Array<{ chatId: string; text: string; options?: Record<string, unknown> }> = [];
 let metricsWritten: Array<{ name: string; value: number }> = [];
@@ -199,6 +201,30 @@ describe("handleCommand (board REST path)", () => {
     await handleCommand(ctx, "token", "456", "connect", "MyCompany", undefined, undefined, undefined, CONFIG);
     expect(getChatCompanyName("456")).toBe("MyCompany");
     expect(resolveCompanyId("456", CONFIG)).toBe("co-1");
+    expect(sentMessages[0].text).toContain("Linked");
+  });
+
+  it("/connect auto-registers the verified Telegram actor for targeted decisions", async () => {
+    const ctx = mockCtx();
+    await handleCommand(
+      ctx,
+      "token",
+      "456",
+      "connect",
+      "MyCompany",
+      undefined,
+      undefined,
+      undefined,
+      {
+        ...CONFIG,
+        boardUserAliases: { tue_jonas: JONAS_USER_ID },
+      },
+      { id: 6870350866, username: "tue_jonas", first_name: "Jonas" },
+    );
+
+    expect(getChatCompanyName("456")).toBe("MyCompany");
+    expect(getUserChatMapping("co-1", JONAS_USER_ID)).toBe("456");
+    expect(stateStore["telegram-user-chat-mappings"]).toEqual({ [JONAS_USER_ID]: "456" });
     expect(sentMessages[0].text).toContain("Linked");
   });
 
