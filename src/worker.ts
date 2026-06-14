@@ -50,6 +50,10 @@ import {
   resolveCompanyId as resolveCompanyIdFromMap,
   createIssue,
   updateIssue,
+  resolveUserChatId as resolveMappedUserChatId,
+  configuredActorMappings,
+  configuredUserChatMappings,
+  resolveActorUserId,
 } from "./host-api.js";
 import { fetchApprovalContext, submitApprovalDecision } from "./approvals-api.js";
 import {
@@ -101,9 +105,11 @@ type TelegramConfig = {
   // User-scoped decision routing (TWX-517/TWX-525)
   // Maps Paperclip userId → Telegram chatId for targeted decision delivery.
   userChatMappings?: Record<string, string>;
+  boardUserChatIds?: Record<string, string>;
   // Maps Telegram username or numeric user ID (as string) → Paperclip userId.
   // Used to validate inbound callbacks and replies against the decision owner.
   telegramActorMappings?: Record<string, string>;
+  boardUserAliases?: Record<string, string>;
 };
 
 const INTERACTION_DELIVERIES_NAMESPACE = "plugin_telegram_63f79ea5a3";
@@ -188,28 +194,6 @@ function firstNonEmptyString(source: Record<string, unknown>, keys: string[]): s
     if (typeof value === "string" && value.trim().length > 0) return value.trim();
   }
   return null;
-}
-
-// Resolve the Telegram chatId for a Paperclip userId from plugin config.
-function resolveUserChatId(
-  userChatMappings: Record<string, string> | undefined,
-  userId: string,
-): string | null {
-  if (!userId || !userChatMappings) return null;
-  return userChatMappings[userId] ?? null;
-}
-
-// Resolve the Paperclip userId for a Telegram actor (username or numeric id).
-// Looks up username first, then falls back to numeric ID string.
-export function resolveActorUserId(
-  telegramActorMappings: Record<string, string> | undefined,
-  username: string | undefined,
-  numericId: number,
-): string | null {
-  if (!telegramActorMappings) return null;
-  if (username && telegramActorMappings[username]) return telegramActorMappings[username]!;
-  const numStr = String(numericId);
-  return telegramActorMappings[numStr] ?? null;
 }
 
 function formatInboundAuditPrefix(msg: NonNullable<TelegramUpdate["message"]>): string {
@@ -852,7 +836,7 @@ async function tryRouteInboundReply(
   if (mapping.entityType === "interaction" && mapping.issueId && mapping.interactionId) {
     if (mapping.ownerUserId) {
       const actorUserId = resolveActorUserId(
-        config.telegramActorMappings,
+        configuredActorMappings(config),
         msg.from?.username,
         msg.from?.id ?? 0,
       );
@@ -1010,7 +994,7 @@ export async function dispatchInteractionNotification(
     let ownerUserId: string | null = null;
 
     if (targetUserId) {
-      targetChatId = resolveUserChatId(input.userChatMappings, targetUserId);
+      targetChatId = await resolveMappedUserChatId(ctx, event.companyId, targetUserId, input.userChatMappings);
       if (targetChatId) {
         ownerUserId = targetUserId;
       } else {
@@ -1435,7 +1419,7 @@ const plugin = definePlugin({
         boardApiToken,
         defaultChatId: config.defaultChatId,
         approvalsChatId: config.approvalsChatId,
-        userChatMappings: config.userChatMappings,
+        userChatMappings: configuredUserChatMappings(config),
         notify,
       });
     });
@@ -1885,7 +1869,7 @@ export async function handleUpdate(
   boardApiToken: string = "",
 ): Promise<void> {
   if (update.callback_query) {
-    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, config.telegramActorMappings);
+    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, configuredActorMappings(config));
     return;
   }
 
@@ -1941,7 +1925,7 @@ export async function handleUpdate(
 
     // Built-in commands. Pass config so the handlers reach the board REST API
     // (the gated SDK host RPCs throw "unknown invocation scope" in the poll loop).
-    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, config);
+    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, config, msg.from);
     return;
   }
 

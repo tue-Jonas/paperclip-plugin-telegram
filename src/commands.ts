@@ -14,6 +14,9 @@ import {
   updateIssue,
   setChatCompany,
   resolveCompanyId,
+  resolveActorUserId,
+  persistUserChatMapping,
+  configuredActorMappings,
 } from "./host-api.js";
 
 type BotCommand = {
@@ -44,6 +47,7 @@ export async function handleCommand(
   baseUrl?: string,
   publicUrl?: string,
   config: HostApiConfig = {},
+  actor?: { id: number; username?: string; first_name?: string },
 ): Promise<void> {
   await ctx.metrics.write(METRIC_NAMES.commandsHandled, 1);
 
@@ -67,7 +71,7 @@ export async function handleCommand(
       await handleHelp(ctx, token, chatId, messageThreadId);
       break;
     case "connect":
-      await handleConnect(ctx, token, chatId, args, config, messageThreadId);
+      await handleConnect(ctx, token, chatId, args, config, messageThreadId, actor);
       break;
     case "connect_topic":
       await handleConnectTopic(ctx, token, chatId, args, messageThreadId);
@@ -299,6 +303,7 @@ async function handleConnect(
   companyArg: string,
   config: HostApiConfig,
   messageThreadId?: number,
+  actor?: { id: number; username?: string; first_name?: string },
 ): Promise<void> {
   if (!companyArg.trim()) {
     try {
@@ -336,6 +341,13 @@ async function handleConnect(
     // (host state is unreadable from the poll loop under the scope bug).
     setChatCompany(chatId, match.id, match.name ?? input);
 
+    const actorUserId = actor
+      ? resolveActorUserId(configuredActorMappings(config), actor.username, actor.id)
+      : null;
+    const userChatMappingResult = actorUserId
+      ? await persistUserChatMapping(ctx, match.id, actorUserId, chatId)
+      : "unmapped";
+
     // Best-effort durable writes: these will succeed once the host propagates
     // an invocation scope into the poll loop (Option 1 / fork-core fix). Until
     // then they throw and we rely on the in-process map + defaultCompanyId.
@@ -350,15 +362,29 @@ async function handleConnect(
       );
     } catch { /* best effort — gated until host scope fix lands */ }
 
-    await sendMessage(
-      ctx,
-      token,
-      chatId,
+    const responseLines = [
       `${escapeMarkdownV2("🔗")} ${escapeMarkdownV2("Linked this chat to company:")} *${escapeMarkdownV2(match.name ?? input)}*`,
-      { parseMode: "MarkdownV2", messageThreadId },
-    );
+    ];
+    if (userChatMappingResult === "persisted") {
+      responseLines.push(escapeMarkdownV2("Decision cards for your Paperclip user will route to this chat."));
+    } else if (userChatMappingResult === "memory_only") {
+      responseLines.push(escapeMarkdownV2("Decision cards are linked until the bot restarts. Re-run /connect after a restart if decision cards stop arriving."));
+    } else if (actor) {
+      responseLines.push(escapeMarkdownV2("Decision-card routing was not linked because this Telegram user is not mapped to a Paperclip user."));
+    }
 
-    ctx.logger.info("Chat linked to company", { chatId, companyId: match.id, companyName: match.name });
+    await sendMessage(ctx, token, chatId, responseLines.join("\n"), {
+      parseMode: "MarkdownV2",
+      messageThreadId,
+    });
+
+    ctx.logger.info("Chat linked to company", {
+      chatId,
+      companyId: match.id,
+      companyName: match.name,
+      actorUserId,
+      userChatMappingResult,
+    });
   } catch (err) {
     await sendMessage(
       ctx,

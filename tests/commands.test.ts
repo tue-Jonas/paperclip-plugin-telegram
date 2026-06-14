@@ -4,6 +4,7 @@ import {
   __resetHostApiState,
   resolveCompanyId,
   getChatCompanyName,
+  getUserChatMapping,
 } from "../src/host-api.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 
@@ -18,6 +19,7 @@ const CONFIG = {
   defaultCompanyId: "co-1",
   paperclipBaseUrl: "http://localhost:3100",
 };
+const JONAS_USER_ID = "U1v5HFLADePyPLXPTX17rsUiCWkG40zl";
 
 let sentMessages: Array<{ chatId: string; text: string; options?: Record<string, unknown> }> = [];
 let metricsWritten: Array<{ name: string; value: number }> = [];
@@ -29,6 +31,10 @@ type Fixtures = {
   companies: Array<Record<string, unknown>>;
   agents: Array<Record<string, unknown>>;
   issues: Array<Record<string, unknown>>;
+};
+
+type MockCtxOptions = {
+  stateSetThrows?: boolean;
 };
 
 const DEFAULT_FIXTURES: Fixtures = {
@@ -50,7 +56,7 @@ function jsonRes(body: unknown, status = 200): Response {
   });
 }
 
-function mockCtx(fx: Fixtures = DEFAULT_FIXTURES): PluginContext {
+function mockCtx(fx: Fixtures = DEFAULT_FIXTURES, opts: MockCtxOptions = {}): PluginContext {
   return {
     http: {
       fetch: vi.fn(async (url: string, init?: { method?: string; body?: string }) => {
@@ -88,6 +94,7 @@ function mockCtx(fx: Fixtures = DEFAULT_FIXTURES): PluginContext {
     state: {
       get: vi.fn(async (key: { stateKey: string }) => stateStore[key.stateKey] ?? null),
       set: vi.fn(async (key: { stateKey: string }, value: unknown) => {
+        if (opts.stateSetThrows) throw new Error("state unavailable");
         stateStore[key.stateKey] = value;
       }),
     },
@@ -200,6 +207,82 @@ describe("handleCommand (board REST path)", () => {
     expect(getChatCompanyName("456")).toBe("MyCompany");
     expect(resolveCompanyId("456", CONFIG)).toBe("co-1");
     expect(sentMessages[0].text).toContain("Linked");
+  });
+
+  it("/connect auto-registers the verified Telegram actor for targeted decisions", async () => {
+    const ctx = mockCtx();
+    await handleCommand(
+      ctx,
+      "token",
+      "456",
+      "connect",
+      "MyCompany",
+      undefined,
+      undefined,
+      undefined,
+      {
+        ...CONFIG,
+        telegramActorMappings: {},
+        boardUserAliases: { tue_jonas: JONAS_USER_ID },
+      },
+      { id: 6870350866, username: "tue_jonas", first_name: "Jonas" },
+    );
+
+    expect(getChatCompanyName("456")).toBe("MyCompany");
+    expect(getUserChatMapping("co-1", JONAS_USER_ID)).toBe("456");
+    expect(stateStore["telegram-user-chat-mappings"]).toEqual({ [JONAS_USER_ID]: "456" });
+    expect(sentMessages[0].text).toContain("Linked");
+    expect(sentMessages[0].text).toContain("Decision cards");
+  });
+
+  it("/connect warns when actor routing is memory-only", async () => {
+    const ctx = mockCtx(DEFAULT_FIXTURES, { stateSetThrows: true });
+    await handleCommand(
+      ctx,
+      "token",
+      "456",
+      "connect",
+      "MyCompany",
+      undefined,
+      undefined,
+      undefined,
+      {
+        ...CONFIG,
+        telegramActorMappings: {},
+        boardUserAliases: { tue_jonas: JONAS_USER_ID },
+      },
+      { id: 6870350866, username: "TUE_JONAS", first_name: "Jonas" },
+    );
+
+    expect(getChatCompanyName("456")).toBe("MyCompany");
+    expect(getUserChatMapping("co-1", JONAS_USER_ID)).toBe("456");
+    expect(stateStore["telegram-user-chat-mappings"]).toBeUndefined();
+    expect(sentMessages[0].text).toContain("until the bot restarts");
+    expect(sentMessages[0].text).toContain("Re\\-run /connect");
+  });
+
+  it("/connect still links the company when the Telegram actor is unmapped", async () => {
+    const ctx = mockCtx();
+    await handleCommand(
+      ctx,
+      "token",
+      "456",
+      "connect",
+      "MyCompany",
+      undefined,
+      undefined,
+      undefined,
+      {
+        ...CONFIG,
+        boardUserAliases: { someone_else: JONAS_USER_ID },
+      },
+      { id: 6870350866, username: "tue_jonas", first_name: "Jonas" },
+    );
+
+    expect(getChatCompanyName("456")).toBe("MyCompany");
+    expect(getUserChatMapping("co-1", JONAS_USER_ID)).toBeNull();
+    expect(sentMessages[0].text).toContain("Linked");
+    expect(sentMessages[0].text).toContain("not linked");
   });
 
   it("/connect without args shows usage and lists companies", async () => {
