@@ -193,6 +193,23 @@ describe("handleUpdate decision association", () => {
     } as unknown as Parameters<typeof handleUpdate>[3];
   }
 
+  function replyUpdate(text: string, replyToId: number) {
+    return {
+      update_id: 2,
+      message: {
+        message_id: 1000,
+        from: { id: 6870350866, username: "tue_jonas" },
+        chat: { id: 6870350866, type: "private" },
+        text,
+        reply_to_message: {
+          message_id: replyToId,
+          text: "Decision needed for TWX-579",
+          from: { is_bot: true },
+        },
+      },
+    } as unknown as Parameters<typeof handleUpdate>[3];
+  }
+
   it("routes a top-level free-text reply to the pending decision, not a new inbox issue", async () => {
     const ctx = makeCtx({ calls, sent, metrics, pendingDecision: DECISION_MAPPING });
     await handleUpdate(
@@ -218,6 +235,21 @@ describe("handleUpdate decision association", () => {
 
     expect(calls.some((c) => /\/api\/companies\/[^/]+\/issues$/.test(c.url) && c.method === "POST")).toBe(true);
     expect(calls.some((c) => c.url.includes("/interactions/"))).toBe(false);
+    expect(sent.some((m) => m.text.includes("Forwarded to agent"))).toBe(true);
+  });
+
+  it("falls through to inbox for an unmapped bot reply and preserves the quote in the issue body", async () => {
+    const ctx = makeCtx({ calls, sent, metrics, pendingDecision: null });
+    await handleUpdate(
+      ctx, "tg-token", CONFIG,
+      replyUpdate("Is it Thomas? If yes send him a WhatsApp what to do", 157),
+      BASE_URL, undefined, "pcp_board_test",
+    );
+
+    const createCall = calls.find((c) => /\/api\/companies\/[^/]+\/issues$/.test(c.url) && c.method === "POST");
+    expect(createCall).toBeDefined();
+    expect(String(createCall!.body.description)).toContain("Replying to Telegram message 157:");
+    expect(String(createCall!.body.description)).toContain("> Decision needed for TWX-579");
     expect(sent.some((m) => m.text.includes("Forwarded to agent"))).toBe(true);
   });
 
