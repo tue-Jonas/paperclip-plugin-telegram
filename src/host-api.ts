@@ -27,6 +27,14 @@ export type HostApiConfig = {
   boardApiTokenRef?: string;
   /** Company used for chats with no /connect mapping (host state is unavailable under the scope bug). */
   defaultCompanyId?: string;
+  /** Maps Paperclip userId → Telegram chatId for targeted decision delivery. */
+  userChatMappings?: Record<string, string>;
+  /** Legacy name kept by the TWB live config before TWX-593. */
+  boardUserChatIds?: Record<string, string>;
+  /** Maps Telegram username or numeric user ID (as string) → Paperclip userId. */
+  telegramActorMappings?: Record<string, string>;
+  /** Legacy name kept by the TWB live config before TWX-593. */
+  boardUserAliases?: Record<string, string>;
 };
 
 export type HostCompany = { id: string; name?: string; issuePrefix?: string };
@@ -53,6 +61,8 @@ export type HostIssue = {
 // keeps /connect links alive for the worker's lifetime; on restart we fall back
 // to defaultCompanyId (routing still works — see resolveChat() in worker.ts).
 const chatCompanyMap = new Map<string, { companyId: string; companyName?: string }>();
+const userChatMap = new Map<string, string>();
+const USER_CHAT_MAPPINGS_STATE_KEY = "telegram-user-chat-mappings";
 
 export function setChatCompany(chatId: string, companyId: string, companyName?: string): void {
   chatCompanyMap.set(chatId, { companyId, companyName });
@@ -61,6 +71,7 @@ export function setChatCompany(chatId: string, companyId: string, companyName?: 
 /** Test seam: clear in-process chat→company links + the cached board token. */
 export function __resetHostApiState(): void {
   chatCompanyMap.clear();
+  userChatMap.clear();
   cachedBoardToken = null;
 }
 
@@ -74,6 +85,113 @@ export function resolveCompanyId(chatId: string, config: HostApiConfig): string 
   if (mapped) return mapped;
   if (config.defaultCompanyId) return config.defaultCompanyId;
   return chatId;
+}
+
+function userChatKey(companyId: string, userId: string): string {
+  return `${companyId}:${userId}`;
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return !!value
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.values(value).every((entry) => typeof entry === "string");
+}
+
+export function resolveActorUserId(
+  telegramActorMappings: Record<string, string> | undefined,
+  username: string | undefined,
+  numericId: number,
+): string | null {
+  if (!telegramActorMappings) return null;
+  const usernameKey = username?.trim();
+  if (usernameKey && telegramActorMappings[usernameKey]) return telegramActorMappings[usernameKey]!;
+  const lowercaseUsernameKey = usernameKey?.toLowerCase();
+  if (lowercaseUsernameKey && telegramActorMappings[lowercaseUsernameKey]) {
+    return telegramActorMappings[lowercaseUsernameKey]!;
+  }
+  const numStr = String(numericId);
+  return telegramActorMappings[numStr] ?? null;
+}
+
+function nonEmptyRecord(record: Record<string, string> | undefined): Record<string, string> | undefined {
+  return record && Object.keys(record).length > 0 ? record : undefined;
+}
+
+export function configuredUserChatMappings(config: HostApiConfig): Record<string, string> | undefined {
+  return nonEmptyRecord(config.userChatMappings) ?? nonEmptyRecord(config.boardUserChatIds);
+}
+
+export function configuredActorMappings(config: HostApiConfig): Record<string, string> | undefined {
+  return nonEmptyRecord(config.telegramActorMappings) ?? nonEmptyRecord(config.boardUserAliases);
+}
+
+export function setUserChatMapping(companyId: string, userId: string, chatId: string): void {
+  userChatMap.set(userChatKey(companyId, userId), chatId);
+}
+
+export function getUserChatMapping(
+  companyId: string,
+  userId: string,
+  staticMappings?: Record<string, string>,
+): string | null {
+  return userChatMap.get(userChatKey(companyId, userId)) ?? staticMappings?.[userId] ?? null;
+}
+
+export async function persistUserChatMapping(
+  ctx: PluginContext,
+  companyId: string,
+  userId: string,
+  chatId: string,
+): Promise<"persisted" | "memory_only"> {
+  setUserChatMapping(companyId, userId, chatId);
+
+  try {
+    const existing = await ctx.state.get({
+      scopeKind: "company",
+      scopeId: companyId,
+      stateKey: USER_CHAT_MAPPINGS_STATE_KEY,
+    });
+    const next = {
+      ...(isStringRecord(existing) ? existing : {}),
+      [userId]: chatId,
+    };
+    await ctx.state.set(
+      { scopeKind: "company", scopeId: companyId, stateKey: USER_CHAT_MAPPINGS_STATE_KEY },
+      next,
+    );
+    return "persisted";
+  } catch {
+    return "memory_only";
+  }
+}
+
+export async function resolveUserChatId(
+  ctx: PluginContext,
+  companyId: string,
+  userId: string,
+  staticMappings?: Record<string, string>,
+): Promise<string | null> {
+  const inMemory = getUserChatMapping(companyId, userId, staticMappings);
+  if (inMemory) return inMemory;
+
+  try {
+    const stored = await ctx.state.get({
+      scopeKind: "company",
+      scopeId: companyId,
+      stateKey: USER_CHAT_MAPPINGS_STATE_KEY,
+    });
+    if (isStringRecord(stored)) {
+      for (const [storedUserId, storedChatId] of Object.entries(stored)) {
+        setUserChatMapping(companyId, storedUserId, storedChatId);
+      }
+      return stored[userId] ?? staticMappings?.[userId] ?? null;
+    }
+  } catch {
+    /* state is best-effort in the plugin poll/event loop */
+  }
+
+  return staticMappings?.[userId] ?? null;
 }
 
 // --- Board token + fetch --------------------------------------------------
@@ -165,10 +283,11 @@ export async function listIssues(
   ctx: PluginContext,
   config: HostApiConfig,
   companyId: string,
-  opts?: { limit?: number; status?: string },
+  opts?: { limit?: number; status?: string; q?: string },
 ): Promise<HostIssue[]> {
   const params = new URLSearchParams({ limit: String(opts?.limit ?? 10) });
   if (opts?.status) params.set("status", opts.status);
+  if (opts?.q) params.set("q", opts.q);
   const data = await hostFetch(
     ctx,
     config,
@@ -200,4 +319,13 @@ export async function updateIssue(
   patch: { status?: string; assigneeAgentId?: string },
 ): Promise<HostIssue> {
   return (await hostFetch(ctx, config, "PATCH", `/api/issues/${issueId}`, patch)) as HostIssue;
+}
+
+export async function createIssueComment(
+  ctx: PluginContext,
+  config: HostApiConfig,
+  issueId: string,
+  body: string,
+): Promise<unknown> {
+  return hostFetch(ctx, config, "POST", `/api/issues/${issueId}/comments`, { body });
 }

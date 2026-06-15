@@ -7,6 +7,8 @@ export const DEFAULT_CONFIG = {
   defaultChatId: "",
   approvalsChatId: "",
   errorsChatId: "",
+  userChatMappings: {} as Record<string, string>,
+  telegramActorMappings: {} as Record<string, string>,
   paperclipBaseUrl: "http://localhost:3100",
   paperclipPublicUrl: "",
   boardApiToken: "",

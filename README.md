@@ -156,6 +156,8 @@ curl -X POST http://127.0.0.1:3100/api/plugins/install \
 | `approvalsChatId` | No | Separate chat for approvals |
 | `errorsChatId` | No | Separate chat for errors |
 | `escalationChatId` | No | Dedicated chat for agent escalations |
+| `userChatMappings` | No | Paperclip user ID -> Telegram chat ID map for targeted decision cards |
+| `telegramActorMappings` | No | Telegram username or numeric sender ID -> Paperclip user ID map used by `/connect` and callback validation |
 | `paperclipBaseUrl` | No | Internal Paperclip API URL (default: http://localhost:3100) |
 | `paperclipPublicUrl` | No | Public URL for issue links in messages |
 | `boardApiToken` | No | Inline `pcp_board_...` token used for approval callbacks (advanced) |
