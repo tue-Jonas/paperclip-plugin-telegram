@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { routeInteractionResponse, handleUpdate } from "../src/worker.js";
+import { routeInteractionResponse, handleUpdate, handleCallbackQuery } from "../src/worker.js";
 import { __resetHostApiState } from "../src/host-api.js";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 
@@ -31,8 +31,9 @@ function makeCtx(opts: {
   sent: Array<{ chatId: string; text: string }>;
   metrics: Array<{ name: string; value: number }>;
   stateSets?: Array<{ stateKey: string; value: unknown }>;
+  initialState?: Record<string, unknown>;
 }): PluginContext {
-  const stateStore = new Map<string, unknown>();
+  const stateStore = new Map<string, unknown>(Object.entries(opts.initialState ?? {}));
   return {
     http: {
       fetch: vi.fn(async (url: string, init?: { method?: string; body?: string }) => {
@@ -75,11 +76,13 @@ vi.mock("../src/telegram-api.js", async () => {
   return {
     ...actual,
     sendMessage: vi.fn(),
+    answerCallbackQuery: vi.fn(),
+    editMessage: vi.fn(async () => true),
     isForum: vi.fn(async () => false),
   };
 });
 
-import { sendMessage } from "../src/telegram-api.js";
+import { sendMessage, editMessage } from "../src/telegram-api.js";
 
 const CONFIG = {
   inboxAgentId: "ceo-1",
@@ -238,7 +241,7 @@ describe("handleUpdate decision association", () => {
     expect(sent.some((m) => m.text.includes("Forwarded to agent"))).toBe(true);
   });
 
-  it("falls through to inbox for an unmapped bot reply and preserves the quote in the issue body", async () => {
+  it("consumes an unmapped bot reply without an issue id and asks for an explicit target", async () => {
     const ctx = makeCtx({ calls, sent, metrics, pendingDecision: null });
     await handleUpdate(
       ctx, "tg-token", CONFIG,
@@ -247,10 +250,10 @@ describe("handleUpdate decision association", () => {
     );
 
     const createCall = calls.find((c) => /\/api\/companies\/[^/]+\/issues$/.test(c.url) && c.method === "POST");
-    expect(createCall).toBeDefined();
-    expect(String(createCall!.body.description)).toContain("Replying to Telegram message 157:");
-    expect(String(createCall!.body.description)).toContain("> Decision needed for TWX-579");
-    expect(sent.some((m) => m.text.includes("Forwarded to agent"))).toBe(true);
+    expect(createCall).toBeUndefined();
+    expect(sent.some((m) => m.text.includes("could not match"))).toBe(true);
+    expect(sent.some((m) => m.text.includes("TWX\\-123"))).toBe(true);
+    expect(sent.some((m) => m.text.includes("Forwarded to agent"))).toBe(false);
   });
 
   it("does not trap the inbox: a stale ask_user_questions pending falls through to inbox, no bounce", async () => {
@@ -299,5 +302,49 @@ describe("handleUpdate decision association", () => {
     // Tried the decision first, got already-resolved, then created the inbox issue.
     expect(calls.some((c) => c.url.includes("/interactions/int-1/"))).toBe(true);
     expect(calls.some((c) => /\/api\/companies\/[^/]+\/issues$/.test(c.url) && c.method === "POST")).toBe(true);
+  });
+});
+
+describe("handleCallbackQuery resolved decision cards", () => {
+  it("keeps the issue identifier and title after accepting an inline decision", async () => {
+    const chatId = "6870350866";
+    const messageId = 42;
+    const ctx = makeCtx({
+      calls,
+      sent,
+      metrics,
+      initialState: {
+        [`msg_${chatId}_${messageId}`]: {
+          entityType: "interaction",
+          companyId: "co-default",
+          issueId: "iss-619",
+          issueIdentifier: "TWX-619",
+          issueTitle: "Telegram resolved decision cards",
+          interactionId: "int-619",
+          interactionKind: "request_confirmation",
+        },
+      },
+    });
+
+    await handleCallbackQuery(
+      ctx,
+      "tg-token",
+      {
+        id: "cb-619",
+        data: "interaction_accept",
+        from: { id: 6870350866, username: "tue_jonas" },
+        message: {
+          message_id: messageId,
+          chat: { id: Number(chatId) },
+          text: "Decision needed for TWX-619",
+        },
+      },
+      BASE_URL,
+      "pcp_board_test",
+    );
+
+    const editCall = (editMessage as unknown as ReturnType<typeof vi.fn>).mock.calls.at(-1);
+    expect(editCall?.[4]).toContain("TWX\\-619");
+    expect(editCall?.[4]).toContain("Telegram resolved decision cards");
   });
 });

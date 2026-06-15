@@ -50,6 +50,12 @@ import {
   resolveCompanyId as resolveCompanyIdFromMap,
   createIssue,
   updateIssue,
+  listIssues,
+  createIssueComment,
+  resolveUserChatId as resolveMappedUserChatId,
+  configuredActorMappings,
+  configuredUserChatMappings,
+  resolveActorUserId,
 } from "./host-api.js";
 import { fetchApprovalContext, submitApprovalDecision } from "./approvals-api.js";
 import {
@@ -101,9 +107,11 @@ type TelegramConfig = {
   // User-scoped decision routing (TWX-517/TWX-525)
   // Maps Paperclip userId → Telegram chatId for targeted decision delivery.
   userChatMappings?: Record<string, string>;
+  boardUserChatIds?: Record<string, string>;
   // Maps Telegram username or numeric user ID (as string) → Paperclip userId.
   // Used to validate inbound callbacks and replies against the decision owner.
   telegramActorMappings?: Record<string, string>;
+  boardUserAliases?: Record<string, string>;
 };
 
 const INTERACTION_DELIVERIES_NAMESPACE = "plugin_telegram_63f79ea5a3";
@@ -177,6 +185,7 @@ type RecentChatContextEntry = {
 const RECENT_CHAT_CONTEXT_KEY_PREFIX = "recent_ctx_";
 const RECENT_CHAT_CONTEXT_LIMIT = 10;
 const RECENT_CHAT_CONTEXT_DISPLAY_LIMIT = 5;
+const LEADING_ISSUE_TARGET_RE = /^\s*([A-Z][A-Z0-9]+-\d+)\s*[:\-]\s*(.+)$/s;
 
 function toRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" ? value as Record<string, unknown> : {};
@@ -188,28 +197,6 @@ function firstNonEmptyString(source: Record<string, unknown>, keys: string[]): s
     if (typeof value === "string" && value.trim().length > 0) return value.trim();
   }
   return null;
-}
-
-// Resolve the Telegram chatId for a Paperclip userId from plugin config.
-function resolveUserChatId(
-  userChatMappings: Record<string, string> | undefined,
-  userId: string,
-): string | null {
-  if (!userId || !userChatMappings) return null;
-  return userChatMappings[userId] ?? null;
-}
-
-// Resolve the Paperclip userId for a Telegram actor (username or numeric id).
-// Looks up username first, then falls back to numeric ID string.
-export function resolveActorUserId(
-  telegramActorMappings: Record<string, string> | undefined,
-  username: string | undefined,
-  numericId: number,
-): string | null {
-  if (!telegramActorMappings) return null;
-  if (username && telegramActorMappings[username]) return telegramActorMappings[username]!;
-  const numStr = String(numericId);
-  return telegramActorMappings[numStr] ?? null;
 }
 
 function formatInboundAuditPrefix(msg: NonNullable<TelegramUpdate["message"]>): string {
@@ -225,6 +212,55 @@ function buildInboundAuditComment(
   body: string,
 ): string {
   return `${formatInboundAuditPrefix(msg)}\n\n${body}`;
+}
+
+function extractOrgLine(text?: string): string | null {
+  if (!text) return null;
+  const line = text.split(/\r?\n/).find((entry) => /\bOrg\b/i.test(entry));
+  if (!line) return null;
+  return line.replace(/[*_`[\]()~>#+=|{}.!-]/g, "").trim() || null;
+}
+
+async function resolveCompanyName(ctx: PluginContext, companyId?: string): Promise<string | null> {
+  if (!companyId) return null;
+  try {
+    const company = await ctx.companies.get(companyId);
+    return company?.name ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function formatResolvedDecisionMessage(
+  ctx: PluginContext,
+  resolution: string,
+  actor: string | null,
+  mapping?: StoredMessageMapping | null,
+  originalText?: string,
+): Promise<string> {
+  const lines = [
+    actor
+      ? `${escapeMarkdownV2(resolution)} by ${escapeMarkdownV2(actor)}`
+      : escapeMarkdownV2(resolution),
+  ];
+
+  if (mapping?.issueIdentifier) {
+    const issueLine = mapping.issueTitle
+      ? `${escapeMarkdownV2(mapping.issueIdentifier)} ${escapeMarkdownV2("·")} ${escapeMarkdownV2(mapping.issueTitle)}`
+      : escapeMarkdownV2(mapping.issueIdentifier);
+    lines.push(issueLine);
+
+    const companyName = await resolveCompanyName(ctx, mapping.companyId);
+    const orgLine = companyName ? `🏢 Org: ${companyName}` : extractOrgLine(originalText);
+    if (orgLine) lines.push(escapeMarkdownV2(orgLine));
+    return lines.join("\n");
+  }
+
+  if (originalText) {
+    lines.push("", escapeMarkdownV2(originalText));
+  }
+
+  return lines.join("\n");
 }
 
 type ParsedQuestion = NonNullable<StoredMessageMapping["interactionQuestions"]>[number];
@@ -667,6 +703,134 @@ async function clearPendingDecision(ctx: PluginContext, chatId: string): Promise
   } catch { /* best effort */ }
 }
 
+function inboundStateKey(chatId: string, messageId: number): string {
+  return `inbound_${chatId}_${messageId}`;
+}
+
+async function wasInboundProcessed(
+  ctx: PluginContext,
+  chatId: string,
+  messageId: number,
+): Promise<boolean> {
+  try {
+    return !!(await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: inboundStateKey(chatId, messageId),
+    }));
+  } catch {
+    return false;
+  }
+}
+
+async function markInboundProcessed(
+  ctx: PluginContext,
+  chatId: string,
+  messageId: number,
+): Promise<void> {
+  try {
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: inboundStateKey(chatId, messageId) },
+      { routedAt: new Date().toISOString() },
+    );
+  } catch {
+    // best effort
+  }
+}
+
+function parseLeadingIssueTarget(text: string): { identifier: string; body: string } | null {
+  const match = LEADING_ISSUE_TARGET_RE.exec(text);
+  if (!match) return null;
+  const identifier = match[1]?.toUpperCase() ?? "";
+  const body = match[2]?.trim() ?? "";
+  if (!identifier || !body) return null;
+  return { identifier, body };
+}
+
+async function findIssueByIdentifier(
+  ctx: PluginContext,
+  config: TelegramConfig,
+  companyId: string,
+  identifier: string,
+): Promise<{ id: string; identifier?: string } | null> {
+  const issues = await listIssues(ctx, config as HostApiConfig, companyId, {
+    q: identifier,
+    limit: 10,
+  });
+  return issues.find((issue) => issue.identifier?.toUpperCase() === identifier.toUpperCase()) ?? null;
+}
+
+async function tryRouteUnmappedReplyByIssueIdentifier(
+  ctx: PluginContext,
+  token: string,
+  config: TelegramConfig,
+  msg: NonNullable<TelegramUpdate["message"]>,
+  chatId: string,
+  text: string,
+): Promise<boolean> {
+  if (!config.enableInbound || !msg.reply_to_message?.from?.is_bot) return false;
+  if (await wasInboundProcessed(ctx, chatId, msg.message_id)) return true;
+
+  const target = parseLeadingIssueTarget(text);
+  if (!target) {
+    await sendMessage(
+      ctx,
+      token,
+      chatId,
+      escapeMarkdownV2("I could not match that reply to a stored Paperclip message. Reply to the original bot message, or start with an issue id like TWX-123: your answer."),
+      { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+    );
+    await markInboundProcessed(ctx, chatId, msg.message_id);
+    return true;
+  }
+
+  const companyId = resolveCompanyId(config, chatId);
+  try {
+    const issue = await findIssueByIdentifier(ctx, config, companyId, target.identifier);
+    if (!issue) {
+      await sendMessage(
+        ctx,
+        token,
+        chatId,
+        escapeMarkdownV2(`I could not find ${target.identifier} in this Paperclip org. Reply to the original bot message, or start with the right issue id like TWX-123: your answer.`),
+        { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+      );
+      await markInboundProcessed(ctx, chatId, msg.message_id);
+      return true;
+    }
+
+    await createIssueComment(
+      ctx,
+      config as HostApiConfig,
+      issue.id,
+      buildInboundAuditComment(msg, target.body),
+    );
+    await ctx.metrics.write(METRIC_NAMES.inboundRouted, 1);
+    await markInboundProcessed(ctx, chatId, msg.message_id);
+    await sendMessage(
+      ctx,
+      token,
+      chatId,
+      escapeMarkdownV2(`Added your reply to ${issue.identifier ?? target.identifier}.`),
+      { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+    );
+    return true;
+  } catch (err) {
+    ctx.logger.error("Failed to route unmapped Telegram reply by issue identifier", {
+      identifier: target.identifier,
+      companyId,
+      error: String(err),
+    });
+    await sendMessage(
+      ctx,
+      token,
+      chatId,
+      escapeMarkdownV2("I could not route that issue-id reply. Reply to the original bot message, or try again as TWX-123: your answer."),
+      { parseMode: "MarkdownV2", replyToMessageId: msg.message_id },
+    );
+    return true;
+  }
+}
+
 export type InteractionResponseResult =
   | "routed"
   | "needs-input"
@@ -750,28 +914,7 @@ async function tryRouteInboundReply(
   if (!config.enableInbound || !msg.reply_to_message?.from?.is_bot) return false;
 
   const replyToId = msg.reply_to_message.message_id;
-  const inboundKey = `inbound_${chatId}_${msg.message_id}`;
-  let alreadyProcessed: unknown = null;
-  try {
-    alreadyProcessed = await ctx.state.get({
-      scopeKind: "instance",
-      stateKey: inboundKey,
-    });
-  } catch {
-    alreadyProcessed = null;
-  }
-  if (alreadyProcessed) return true;
-
-  const markInboundRouted = async () => {
-    try {
-      await ctx.state.set(
-        { scopeKind: "instance", stateKey: inboundKey },
-        { routedAt: new Date().toISOString() },
-      );
-    } catch {
-      // best effort
-    }
-  };
+  if (await wasInboundProcessed(ctx, chatId, msg.message_id)) return true;
 
   let mapping: StoredMessageMapping | null = null;
   try {
@@ -799,7 +942,7 @@ async function tryRouteInboundReply(
       escalationId: mapping.entityId,
       from: msg.from?.username,
     });
-    await markInboundRouted();
+    await markInboundProcessed(ctx, chatId, msg.message_id);
     return true;
   }
 
@@ -815,7 +958,7 @@ async function tryRouteInboundReply(
         issueId: mapping.entityId,
         from: msg.from?.username,
       });
-      await markInboundRouted();
+      await markInboundProcessed(ctx, chatId, msg.message_id);
     } catch (err) {
       ctx.logger.error("Failed to route inbound message", {
         issueId: mapping.entityId,
@@ -838,7 +981,7 @@ async function tryRouteInboundReply(
         issueId: mapping.issueId,
         from: msg.from?.username,
       });
-      await markInboundRouted();
+      await markInboundProcessed(ctx, chatId, msg.message_id);
     } catch (err) {
       ctx.logger.error("Failed to route approval reply to issue comment", {
         approvalId: mapping.approvalId ?? mapping.entityId,
@@ -852,7 +995,7 @@ async function tryRouteInboundReply(
   if (mapping.entityType === "interaction" && mapping.issueId && mapping.interactionId) {
     if (mapping.ownerUserId) {
       const actorUserId = resolveActorUserId(
-        config.telegramActorMappings,
+        configuredActorMappings(config),
         msg.from?.username,
         msg.from?.id ?? 0,
       );
@@ -877,7 +1020,7 @@ async function tryRouteInboundReply(
     switch (result) {
       case "routed":
         await clearPendingDecision(ctx, chatId);
-        await markInboundRouted();
+        await markInboundProcessed(ctx, chatId, msg.message_id);
         break;
       case "already-resolved":
         await clearPendingDecision(ctx, chatId);
@@ -1010,7 +1153,7 @@ export async function dispatchInteractionNotification(
     let ownerUserId: string | null = null;
 
     if (targetUserId) {
-      targetChatId = resolveUserChatId(input.userChatMappings, targetUserId);
+      targetChatId = await resolveMappedUserChatId(ctx, event.companyId, targetUserId, input.userChatMappings);
       if (targetChatId) {
         ownerUserId = targetUserId;
       } else {
@@ -1198,23 +1341,26 @@ const plugin = definePlugin({
 
     // --- Event subscriptions ---
 
-    const issuePrefixCache = new Map<string, string>();
+    const companyMetaCache = new Map<string, { issuePrefix?: string; companyName?: string }>();
 
     async function resolveIssueLinksOpts(companyId: string): Promise<IssueLinksOpts> {
-      let prefix = issuePrefixCache.get(companyId);
-      if (!prefix) {
+      let meta = companyMetaCache.get(companyId);
+      if (!meta) {
         // Best-effort: gated company reads can fail inside event handlers on
         // hosts that don't propagate an invocation scope. Degrade to no prefix
-        // (links still work via baseUrl) rather than dropping the notification.
+        // or org name rather than dropping the notification.
         try {
           const company = await ctx.companies.get(companyId);
-          prefix = company?.issuePrefix ?? "";
-          if (prefix) issuePrefixCache.set(companyId, prefix);
+          meta = {
+            issuePrefix: company?.issuePrefix || undefined,
+            companyName: company?.name || undefined,
+          };
         } catch {
-          prefix = "";
+          meta = {};
         }
+        companyMetaCache.set(companyId, meta);
       }
-      return { baseUrl: publicUrl, issuePrefix: prefix || undefined };
+      return { baseUrl: publicUrl, issuePrefix: meta.issuePrefix, companyName: meta.companyName };
     }
 
     const notify = async (
@@ -1435,7 +1581,7 @@ const plugin = definePlugin({
         boardApiToken,
         defaultChatId: config.defaultChatId,
         approvalsChatId: config.approvalsChatId,
-        userChatMappings: config.userChatMappings,
+        userChatMappings: configuredUserChatMappings(config),
         notify,
       });
     });
@@ -1885,7 +2031,7 @@ export async function handleUpdate(
   boardApiToken: string = "",
 ): Promise<void> {
   if (update.callback_query) {
-    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, config.telegramActorMappings);
+    await handleCallbackQuery(ctx, token, update.callback_query, baseUrl, boardApiToken, configuredActorMappings(config));
     return;
   }
 
@@ -1941,7 +2087,7 @@ export async function handleUpdate(
 
     // Built-in commands. Pass config so the handlers reach the board REST API
     // (the gated SDK host RPCs throw "unknown invocation scope" in the poll loop).
-    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, config);
+    await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl, publicUrl, config, msg.from);
     return;
   }
 
@@ -1988,9 +2134,14 @@ export async function handleUpdate(
 
   // --- Inbox wake: plain text from the board → new issue for the configured agent ---
   // First let real bot-replies route through the existing inbound mapping path.
-  // If there is no matching mapping, the reply may still become a fresh inbox
-  // issue with quoted context below.
+  // If there is no matching mapping, the reply must either route via an
+  // explicit leading issue id or be consumed with targeting guidance. Do not
+  // also turn the same ambiguous reply into a fresh inbox item.
   if (await tryRouteInboundReply(ctx, token, config, msg, chatId, text, baseUrl, boardApiToken)) {
+    return;
+  }
+
+  if (await tryRouteUnmappedReplyByIssueIdentifier(ctx, token, config, msg, chatId, text)) {
     return;
   }
 
@@ -2105,12 +2256,16 @@ export async function handleCallbackQuery(
       await answerCallbackQuery(ctx, token, query.id, "Approved");
 
       if (chatId && messageId) {
+        const mapping = await ctx.state.get({
+          scopeKind: "instance",
+          stateKey: `msg_${chatId}_${messageId}`,
+        }) as StoredMessageMapping | null;
         await editMessage(
           ctx,
           token,
           chatId,
           messageId,
-          `${escapeMarkdownV2("\u2705")} *Approved* by ${escapeMarkdownV2(actor)}`,
+          await formatResolvedDecisionMessage(ctx, "✅ Approved", actor, mapping, query.message?.text),
           { parseMode: "MarkdownV2" },
         );
       }
@@ -2173,7 +2328,13 @@ export async function handleCallbackQuery(
         token,
         chatId,
         messageId,
-        `${escapeMarkdownV2(action === "accept" ? "✅ Accepted" : "❌ Rejected")} by ${escapeMarkdownV2(actor)}`,
+        await formatResolvedDecisionMessage(
+          ctx,
+          action === "accept" ? "✅ Accepted" : "❌ Rejected",
+          actor,
+          mapping,
+          query.message?.text,
+        ),
         { parseMode: "MarkdownV2" },
       );
     } catch (err) {
@@ -2191,7 +2352,13 @@ export async function handleCallbackQuery(
           token,
           chatId,
           messageId,
-          escapeMarkdownV2("This interaction was already resolved."),
+          await formatResolvedDecisionMessage(
+            ctx,
+            "This interaction was already resolved.",
+            null,
+            mapping,
+            query.message?.text,
+          ),
           { parseMode: "MarkdownV2" },
         );
         return;
@@ -2236,12 +2403,16 @@ export async function handleCallbackQuery(
       await answerCallbackQuery(ctx, token, query.id, "Rejected");
 
       if (chatId && messageId) {
+        const mapping = await ctx.state.get({
+          scopeKind: "instance",
+          stateKey: `msg_${chatId}_${messageId}`,
+        }) as StoredMessageMapping | null;
         await editMessage(
           ctx,
           token,
           chatId,
           messageId,
-          `${escapeMarkdownV2("\u274c")} *Rejected* by ${escapeMarkdownV2(actor)}`,
+          await formatResolvedDecisionMessage(ctx, "❌ Rejected", actor, mapping, query.message?.text),
           { parseMode: "MarkdownV2" },
         );
       }

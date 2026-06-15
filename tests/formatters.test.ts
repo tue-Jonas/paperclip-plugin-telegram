@@ -38,6 +38,12 @@ describe("formatIssueCreated", () => {
     expect(msg.options.parseMode).toBe("MarkdownV2");
   });
 
+  it("includes the org name when provided", () => {
+    const msg = formatIssueCreated(mockEvent(), { companyName: "TWB Digital" });
+    expect(msg.text).toContain("Org");
+    expect(msg.text).toContain("TWB Digital");
+  });
+
   it("includes metadata fields when available", () => {
     const msg = formatIssueCreated(mockEvent({
       status: "open",
@@ -121,6 +127,15 @@ describe("formatApprovalCreated", () => {
     expect(buttons[1].callback_data).toBe("reject_apr-1");
   });
 
+  it("shows org context and native-reply guidance", () => {
+    const msg = formatApprovalCreated(mockEvent({
+      approvalId: "apr-1",
+      linkedIssues: [{ identifier: "TWX-611", title: "Telegram decisions" }],
+    }), { companyName: "TWB Digital" });
+    expect(msg.text).toContain("TWB Digital");
+    expect(msg.text).toContain("Reply to this message");
+  });
+
   it("falls back to entityId for approvalId", () => {
     const msg = formatApprovalCreated(mockEvent({ approvalId: undefined }));
     const buttons = msg.options.inlineKeyboard![0];
@@ -191,6 +206,7 @@ describe("formatInteractionCreated", () => {
     }));
     expect(msg.text).toContain("Approve this rollout");
     expect(msg.text).toContain("Decision needed");
+    expect(msg.text).toContain("Reply to this message");
     expect(msg.text).not.toContain("Kind:");
     expect(msg.text).not.toContain("Interaction ID");
     const buttons = msg.options.inlineKeyboard![0];
@@ -226,7 +242,7 @@ describe("formatInteractionCreated", () => {
     expect(msg.text).not.toContain("p0");
     expect(msg.text).not.toContain("• all =");
     expect(msg.text).not.toContain("Reply format");
-    expect(msg.text).toContain("Reply with option labels");
+    expect(msg.text).toContain("Reply to this message with option labels");
   });
 
   it("renders details in a dedicated block with paragraph breaks", () => {

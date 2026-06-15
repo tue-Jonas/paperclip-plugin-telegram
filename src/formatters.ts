@@ -21,7 +21,7 @@ function code(s: string): string {
   return `\`${esc(s)}\``;
 }
 
-export type IssueLinksOpts = { baseUrl?: string; issuePrefix?: string };
+export type IssueLinksOpts = { baseUrl?: string; issuePrefix?: string; companyName?: string };
 
 type InteractionOption = {
   id: string;
@@ -59,6 +59,15 @@ function issueButton(identifier: string, opts?: IssueLinksOpts): { text: string;
     return { text: `Open ${identifier} ↗`, url: `${opts.baseUrl}/${opts.issuePrefix}/issues/${identifier}` };
   }
   return null;
+}
+
+function orgLine(opts?: IssueLinksOpts): string | null {
+  return opts?.companyName ? `${esc("🏢")} ${bold("Org")}: ${esc(opts.companyName)}` : null;
+}
+
+function addOrgLine(lines: string[], opts?: IssueLinksOpts): void {
+  const line = orgLine(opts);
+  if (line) lines.push(line);
 }
 
 function asPayload(value: unknown): Payload {
@@ -201,6 +210,7 @@ export function formatIssueCreated(event: PluginEvent, opts?: IssueLinksOpts): F
     `${esc("📋")} ${bold("Issue Created")}: ${issueLink(identifier, opts)}`,
     bold(title),
   ];
+  addOrgLine(lines, opts);
 
   const meta: string[] = [];
   if (status) meta.push(`Status: ${code(status)}`);
@@ -234,6 +244,7 @@ export function formatIssueDone(event: PluginEvent, opts?: IssueLinksOpts): Form
     `${esc("✅")} ${bold("Issue Completed")}: ${issueLink(identifier, opts)}`,
     `${bold(title)} ${esc("is now done.")}`,
   ];
+  addOrgLine(lines, opts);
 
   if (comment) {
     const truncated = truncateAtWord(comment, 300);
@@ -277,6 +288,7 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
     `${esc("🔔")} ${bold("Approval needed")}`,
     bold(prompt),
   ];
+  addOrgLine(lines, opts);
 
   lines.push(`${bold("Type")}: ${esc(approvalType)}`);
   if (agentName) lines.push(`${bold("Requested by")}: ${esc(agentName)}`);
@@ -287,6 +299,7 @@ export function formatApprovalCreated(event: PluginEvent, opts?: IssueLinksOpts)
   if (recommendedDefault) lines.push(`${bold("Recommended Default")}: ${esc(recommendedDefault)}`);
   const risksBlock = formatOptionList(risks);
   if (risksBlock) lines.push(`${bold("Risks")}:\n${risksBlock}`);
+  lines.push("", esc("Use the buttons for the decision. Reply to this message with extra context for the linked issue."));
 
   // Add linked issues if present
   const linkedIssues = Array.isArray(p.linkedIssues) ? p.linkedIssues as Array<Payload> : [];
@@ -342,6 +355,7 @@ export function formatInteractionCreated(event: PluginEvent, opts?: IssueLinksOp
   const lines: string[] = [
     `${esc(header.emoji)} ${bold(header.title)} ${esc("—")} ${issueSummary}`,
   ];
+  addOrgLine(lines, opts);
 
   const keyboard: Array<Array<{ text: string; callback_data?: string; url?: string }>> = [];
 
@@ -352,6 +366,7 @@ export function formatInteractionCreated(event: PluginEvent, opts?: IssueLinksOp
     const rejectLabel = firstNonEmptyString(interactionPayload, ["rejectLabel"]) ?? "Reject";
     lines.push("", bold(prompt));
     if (details) lines.push(...formatDetailsBlock(details, 1000, opts));
+    lines.push("", esc("Reply to this message with yes/approve, or with changes to reject with a reason."));
     keyboard.push([
       { text: acceptLabel, callback_data: "interaction_accept" },
       { text: rejectLabel, callback_data: "interaction_reject" },
@@ -367,7 +382,9 @@ export function formatInteractionCreated(event: PluginEvent, opts?: IssueLinksOp
       }
       if (question.options.length > 6) lines.push(`• ${esc(`+${String(question.options.length - 6)} more`)}`);
     }
-    if (keyboard.length === 0) lines.push("\n" + esc("Reply with option labels. For multiple questions: Q1: <option label>"));
+    if (keyboard.length === 0) {
+      lines.push("\n" + esc("Reply to this message with option labels. For multiple questions: Q1: <option label>"));
+    }
   } else {
     const fallbackPrompt = firstNonEmptyString(interactionPayload, ["prompt", "title", "question"]);
     if (fallbackPrompt) lines.push("", bold(fallbackPrompt));
@@ -395,6 +412,7 @@ export function formatAgentError(event: PluginEvent, opts?: IssueLinksOpts): For
   return {
     text: [
       `${esc("❌")} ${bold("Agent Error")}`,
+      ...(orgLine(opts) ? [orgLine(opts)!] : []),
       `${bold(agentName)} ${esc("hit an error")}`,
       "",
       bold("Details"),
@@ -421,8 +439,13 @@ export function formatAgentRunStarted(event: PluginEvent, opts?: IssueLinksOpts)
     buttons.push({ text: "View Run ↗", url });
   }
 
+  const lines = [
+    `${esc("▶️")} ${bold(agentName)} ${esc("started a new run")}`,
+  ];
+  addOrgLine(lines, opts);
+
   return {
-    text: `${esc("▶️")} ${bold(agentName)} ${esc("started a new run")}`,
+    text: lines.join("\n"),
     options: {
       parseMode: "MarkdownV2",
       disableNotification: true,
@@ -445,8 +468,13 @@ export function formatAgentRunFinished(event: PluginEvent, opts?: IssueLinksOpts
     buttons.push({ text: "View Run ↗", url });
   }
 
+  const lines = [
+    `${esc("⏹️")} ${bold(agentName)} ${esc("completed successfully")}`,
+  ];
+  addOrgLine(lines, opts);
+
   return {
-    text: `${esc("⏹️")} ${bold(agentName)} ${esc("completed successfully")}`,
+    text: lines.join("\n"),
     options: {
       parseMode: "MarkdownV2",
       disableNotification: true,
@@ -466,6 +494,7 @@ export function formatIssueBlocked(event: PluginEvent, opts?: IssueLinksOpts): F
     `${esc("⛔")} ${bold("Issue Blocked")}: ${issueLink(identifier, opts)}`,
     bold(title),
   ];
+  addOrgLine(lines, opts);
   if (assigneeName) lines.push(`Assignee: ${esc(assigneeName)}`);
   if (comment) {
     const truncated = truncateAtWord(comment, 300);
@@ -493,6 +522,7 @@ export function formatBoardMention(event: PluginEvent, opts?: IssueLinksOpts): F
     `${esc("💬")} ${bold("Board mentioned")} on ${issueLink(identifier, opts)}`,
   ];
   if (issueTitle) lines.push(bold(issueTitle));
+  addOrgLine(lines, opts);
   lines.push(`${bold(authorName)}:`);
   if (body) {
     const truncated = truncateAtWord(body, 400);

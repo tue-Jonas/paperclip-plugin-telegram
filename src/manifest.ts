@@ -122,6 +122,20 @@ const manifest: PaperclipPluginManifestV1 = {
           "Chat ID for agent error notifications. Falls back to default chat.",
         default: DEFAULT_CONFIG.errorsChatId,
       },
+      userChatMappings: {
+        type: "object",
+        title: "User chat mappings",
+        description:
+          "Paperclip userId -> Telegram chatId mappings for targeted decision cards. /connect can add runtime mappings when telegramActorMappings identifies the sender.",
+        default: DEFAULT_CONFIG.userChatMappings,
+      },
+      telegramActorMappings: {
+        type: "object",
+        title: "Telegram actor mappings",
+        description:
+          "Telegram username or numeric sender id -> Paperclip userId mappings. Used to verify which board user is running /connect and to validate decision callbacks.",
+        default: DEFAULT_CONFIG.telegramActorMappings,
+      },
       escalationChatId: {
         type: "string",
         title: "Escalation Chat ID",
